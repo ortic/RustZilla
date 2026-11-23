@@ -12,6 +12,7 @@ mod icons;
 mod import;
 mod local;
 mod pane;
+mod prompt;
 mod secrets;
 mod session;
 mod site_manager;

@@ -8,6 +8,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Two-factor SSH logins**: keyboard-interactive (PAM, one-time codes).
+  RustZilla answers the "Password:" prompt with the password and asks for
+  the rest, e.g. a verification code, also after a key as the first factor.
+- **Jump hosts** (ProxyJump, `ssh -J`): an SFTP site can connect through
+  `[user@]host[:port]`, logging in there with the same credentials; its
+  host key is checked like the server's.
+- **OpenSSH certificates**: a key file's `<key file>-cert.pub` logs in when
+  the server takes it (the key alone otherwise), and so do certificates in
+  the SSH agent.
 - **WebDAV with HTTP Digest authentication** (RFC 7616: MD5, SHA-256 and
   their `-sess` variants, `qop=auth`), switched to when the server asks for
   it, with fresh nonces taken up as they run out.

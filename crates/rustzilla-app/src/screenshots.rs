@@ -354,6 +354,8 @@ fn security_key_prompts() {
             pin: None,
             known_hosts: dir.join("known_hosts"),
             on_touch: None,
+            on_prompt: None,
+            jump: None,
         }),
         remote_dir: String::new(),
     };

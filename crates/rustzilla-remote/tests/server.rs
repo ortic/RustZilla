@@ -3,10 +3,14 @@
 mod common;
 
 use std::fs;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use rustzilla_remote::testserver::FtpTestServer;
-use rustzilla_remote::testserver::TestServer;
-use rustzilla_remote::{Auth, Connection, ErrorKind, FtpEncryption, Params, Security};
+use rustzilla_remote::testserver::{self, OTP, TestServer};
+use rustzilla_remote::{
+    Auth, Connection, ErrorKind, FtpEncryption, Jump, Params, Prompt, Prompts, Security,
+};
 
 #[test]
 fn test_server_round_trip() {
@@ -193,4 +197,204 @@ fn s3_round_trip() {
         },
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Answers what the server asks with `answers`, one per round, recording
+/// the questions; cancels when they run out.
+fn answering(
+    answers: &'static [&'static str],
+    asked: &Arc<Mutex<Vec<Prompts>>>,
+) -> rustzilla_remote::OnPrompt {
+    let asked = asked.clone();
+    Arc::new(move |prompts: Prompts| {
+        let count = prompts.prompts.len();
+        let round = {
+            let mut asked = asked.lock().unwrap();
+            asked.push(prompts);
+            asked.len() - 1
+        };
+        let answer = answers.get(round)?;
+        Some(vec![(*answer).to_owned(); count])
+    })
+}
+
+#[test]
+fn keyboard_interactive_with_a_one_time_code() {
+    let dir = std::env::temp_dir().join(format!("rustzilla-kbd-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("served/upload")).unwrap();
+    let server = TestServer::start(&dir.join("served"), &dir.join("known_hosts"));
+    let mut params = server.params();
+    params.username = "otp".into();
+
+    // The password answers "Password:"; the user the code.
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    params.on_prompt = Some(answering(&[OTP], &asked));
+    Connection::open(&params).unwrap().disconnect();
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].name, "Two-factor authentication");
+    assert_eq!(
+        asked[0].prompts,
+        [Prompt {
+            text: "Verification code: ".into(),
+            echo: true
+        }]
+    );
+    assert_eq!(asked[0].server, format!("127.0.0.1:{}", server.port));
+
+    // A wrong code.
+    let wrong = Arc::new(Mutex::new(Vec::new()));
+    params.on_prompt = Some(answering(&["999999"], &wrong));
+    let error = Connection::open(&params).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("didn't accept the password and the answers"),
+        "{error}"
+    );
+
+    // Cancelled.
+    let cancelled = Arc::new(Mutex::new(Vec::new()));
+    params.on_prompt = Some(answering(&[], &cancelled));
+    let error = Connection::open(&params).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Cancelled, "{error}");
+
+    // Nobody to ask.
+    params.on_prompt = None;
+    let error = Connection::open(&params).unwrap_err();
+    assert!(error.message.contains("Verification code"), "{error}");
+
+    // A wrong password: asked again, the user answers it.
+    let retried = Arc::new(Mutex::new(Vec::new()));
+    params.auth = Auth::Password("wrong".into());
+    params.on_prompt = Some(answering(&["test", OTP], &retried));
+    common::round_trip(Params::Sftp(params), &dir, common::BASIC);
+    let retried = retried.lock().unwrap();
+    assert!(!retried.is_empty());
+    assert_eq!(retried[0].prompts[0].text, "Password: ");
+    assert!(!retried[0].prompts[0].echo);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn key_then_one_time_code() {
+    let dir = std::env::temp_dir().join(format!("rustzilla-keyotp-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let server = TestServer::start(&dir.join("served"), &dir.join("known_hosts"));
+    let key = dir.join("id_ed25519");
+    testserver::write_client_key(&key);
+    let mut params = server.params();
+    params.username = "keyotp".into();
+    params.auth = Auth::KeyFile {
+        path: key,
+        passphrase: String::new(),
+    };
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    params.on_prompt = Some(answering(&[OTP], &asked));
+    Connection::open(&params).unwrap().disconnect();
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn openssh_certificates() {
+    let dir = std::env::temp_dir().join(format!("rustzilla-cert-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("served/upload")).unwrap();
+    let server = TestServer::start(&dir.join("served"), &dir.join("known_hosts"));
+    let key = dir.join("id_ed25519");
+    testserver::write_client_key(&key);
+    let mut params = server.params();
+    params.username = "cert".into();
+    params.auth = Auth::KeyFile {
+        path: key.clone(),
+        passphrase: String::new(),
+    };
+    // `cert` takes only the certificate.
+    let error = Connection::open(&params).unwrap_err();
+    assert!(
+        error.message.contains("didn't accept the key file"),
+        "{error}"
+    );
+    testserver::write_certificate(&key, "cert", true);
+    common::round_trip(Params::Sftp(params.clone()), &dir, common::BASIC);
+
+    // A certificate the server doesn't take: the key alone.
+    testserver::write_certificate(&key, "test", false);
+    let error = Connection::open(&params).unwrap_err();
+    assert!(
+        error.message.contains("didn't accept the key file"),
+        "{error}"
+    );
+    params.username = "test".into();
+    Connection::open(&params).unwrap().disconnect();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn through_a_jump_host() {
+    let dir = std::env::temp_dir().join(format!("rustzilla-jump-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("served/upload")).unwrap();
+    let server = TestServer::start(&dir.join("served"), &dir.join("known_hosts"));
+    // The jump host's key isn't known yet.
+    let jump = TestServer::start(&dir.join("jump"), &dir.join("jump_known_hosts"));
+    let mut params = server.params();
+    params.jump = Jump::parse(&format!("test@127.0.0.1:{}", jump.port)).unwrap();
+    let error = Connection::open(&params).unwrap_err();
+    assert!(
+        error.message.contains("the jump host 127.0.0.1:"),
+        "{error}"
+    );
+    let key = error.host_key().expect("an unknown host key").clone();
+    assert_eq!(key.port, jump.port);
+    key.trust().unwrap();
+
+    let connection = Connection::open(&params).unwrap();
+    assert_eq!(connection.server(), format!("127.0.0.1:{}", server.port));
+    assert_eq!(jump.tunnels.load(Ordering::SeqCst), 1);
+    connection.disconnect();
+    common::round_trip(Params::Sftp(params.clone()), &dir, common::ALL);
+
+    // The user of the server for the jump host, too.
+    params.jump = Jump::parse(&format!("127.0.0.1:{}", jump.port)).unwrap();
+    Connection::open(&params).unwrap().disconnect();
+    // A wrong password fails on the jump host first.
+    params.auth = Auth::Password("wrong".into());
+    let error = Connection::open(&params).unwrap_err();
+    assert!(
+        error.message.contains("the jump host 127.0.0.1:")
+            && error.message.contains("didn't accept"),
+        "{error}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn jump_hosts_parsed() {
+    let parse = |s: &str| Jump::parse(s).unwrap().unwrap();
+    assert_eq!(
+        parse("bastion"),
+        Jump {
+            host: "bastion".into(),
+            port: 22,
+            username: String::new()
+        }
+    );
+    let jump = parse(" admin@bastion.example.com:2222 ");
+    assert_eq!(
+        (jump.username.as_str(), jump.host.as_str(), jump.port),
+        ("admin", "bastion.example.com", 2222)
+    );
+    assert_eq!(jump.to_string(), "admin@bastion.example.com:2222");
+    let jump = parse("[::1]:2200");
+    assert_eq!((jump.host.as_str(), jump.port), ("::1", 2200));
+    assert_eq!(jump.to_string(), "[::1]:2200");
+    assert_eq!(parse("fe80::1").host, "fe80::1");
+    assert_eq!(Jump::parse("  ").unwrap(), None);
+    assert!(Jump::parse("host:port").is_err());
+    assert!(Jump::parse("user@").is_err());
+    assert!(Jump::parse("[::1").is_err());
 }

@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use russh::keys::PrivateKey;
@@ -28,15 +29,80 @@ py6rf5td32GSy2DzHbe9AAAABWhvc3Qx
 -----END OPENSSH PRIVATE KEY-----
 ";
 
+/// The users of [`TestServer`], besides `test` (password `test`, or the key
+/// of [`write_client_key`]):
+/// - `otp`: keyboard-interactive only, asking "Password:" (`test`), then
+///   "Verification code:" ([`OTP`]);
+/// - `cert`: only a certificate of the key signed by the test CA, for the
+///   principal `cert` ([`write_certificate`]);
+/// - `keyotp`: the key, then [`OTP`] by keyboard-interactive.
+pub const OTP: &str = "123456";
+
+/// Seeds of the test keys.
+const CA_SEED: u8 = 1;
+const OTHER_CA_SEED: u8 = 2;
+const CLIENT_SEED: u8 = 3;
+
+fn seeded_key(seed: u8, comment: &str) -> PrivateKey {
+    use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
+    let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+    PrivateKey::new(KeypairData::Ed25519(keypair), comment).expect("a key")
+}
+
+/// Writes the test client's key file (ed25519, no passphrase).
+pub fn write_client_key(path: &Path) {
+    let key = seeded_key(CLIENT_SEED, "client");
+    fs::write(
+        path,
+        key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .expect("encoding the key"),
+    )
+    .expect("writing the key file");
+}
+
+/// Writes `<key_file>-cert.pub`: a user certificate of the test client's key
+/// for `principal`, signed by the CA the server trusts, or by another.
+pub fn write_certificate(key_file: &Path, principal: &str, trusted_ca: bool) {
+    use russh::keys::ssh_key::certificate::{Builder, CertType};
+    let ca = seeded_key(if trusted_ca { CA_SEED } else { OTHER_CA_SEED }, "ca");
+    let key = seeded_key(CLIENT_SEED, "client");
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the time")
+        .as_secs();
+    let mut builder = Builder::new(
+        [7u8; 16],
+        key.public_key().key_data().clone(),
+        now - 60,
+        now + 3600,
+    )
+    .expect("a certificate builder");
+    builder.cert_type(CertType::User).expect("the type");
+    builder.key_id("test").expect("the key id");
+    builder.valid_principal(principal).expect("the principal");
+    builder.extension("permit-pty", "").expect("an extension");
+    let cert = builder.sign(&ca).expect("signing the certificate");
+    let mut path = key_file.as_os_str().to_owned();
+    path.push("-cert.pub");
+    fs::write(
+        path,
+        cert.to_openssh().expect("encoding the certificate") + "\n",
+    )
+    .expect("writing the certificate");
+}
+
 pub struct TestServer {
     pub port: u16,
     pub root: PathBuf,
     known_hosts: PathBuf,
+    /// How many direct-tcpip channels (`ssh -J`) were opened through it.
+    pub tunnels: Arc<AtomicUsize>,
     _runtime: Runtime,
 }
 
 impl TestServer {
-    /// Serves `root`; its host key is trusted in `known_hosts`.
+    /// Serves `root`; its host key is trusted in `known_hosts`. It forwards
+    /// connections to 127.0.0.1 (direct-tcpip), as a jump host.
     pub fn start(root: &Path, known_hosts: &Path) -> Self {
         fs::create_dir_all(root).expect("creating the server's directory");
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -59,12 +125,16 @@ impl TestServer {
             ..Default::default()
         });
         let served = root.to_owned();
+        let tunnels = Arc::new(AtomicUsize::new(0));
+        let counted = tunnels.clone();
         runtime.spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let config = config.clone();
                 let handler = SshHandler {
                     root: served.clone(),
                     channels: HashMap::new(),
+                    otp_stage: 0,
+                    tunnels: counted.clone(),
                 };
                 tokio::spawn(async move {
                     if let Ok(running) = russh::server::run_stream(config, stream, handler).await {
@@ -77,6 +147,7 @@ impl TestServer {
             port,
             root: root.to_owned(),
             known_hosts: known_hosts.to_owned(),
+            tunnels,
             _runtime: runtime,
         }
     }
@@ -90,6 +161,8 @@ impl TestServer {
             pin: None,
             known_hosts: self.known_hosts.clone(),
             on_touch: None,
+            on_prompt: None,
+            jump: None,
         }
     }
 }
@@ -129,6 +202,26 @@ pub fn write_security_key_file(path: &Path) {
 struct SshHandler {
     root: PathBuf,
     channels: HashMap<ChannelId, Channel<Msg>>,
+    /// Keyboard-interactive: the prompts answered so far.
+    otp_stage: u8,
+    tunnels: Arc<AtomicUsize>,
+}
+
+fn prompt(name: &'static str, instructions: &'static str, text: &'static str, echo: bool) -> Auth {
+    Auth::Partial {
+        name: name.into(),
+        instructions: instructions.into(),
+        prompts: vec![(text.into(), echo)].into(),
+    }
+}
+
+fn otp_prompt() -> Auth {
+    prompt(
+        "Two-factor authentication",
+        "Enter the code of your authenticator app.",
+        "Verification code: ",
+        true,
+    )
 }
 
 impl russh::server::Handler for SshHandler {
@@ -140,6 +233,102 @@ impl russh::server::Handler for SshHandler {
         } else {
             Auth::reject()
         })
+    }
+
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: russh::server::VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        let client = seeded_key(CLIENT_SEED, "client");
+        if key.public_key.key_data() != client.public_key().key_data() {
+            return Ok(Auth::reject());
+        }
+        Ok(match user {
+            "test" => Auth::Accept,
+            // The key is one factor; the code the other.
+            "keyotp" => {
+                self.otp_stage = 1;
+                Auth::Reject {
+                    proceed_with_methods: Some(russh::MethodSet::from(
+                        &[russh::MethodKind::KeyboardInteractive][..],
+                    )),
+                    partial_success: true,
+                }
+            }
+            _ => Auth::reject(),
+        })
+    }
+
+    async fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        certificate: &russh::keys::Certificate,
+    ) -> Result<Auth, Self::Error> {
+        let ca = seeded_key(CA_SEED, "ca");
+        let fingerprint = ca.public_key().fingerprint(russh::keys::HashAlg::Sha256);
+        let valid = certificate.validate([&fingerprint]).is_ok()
+            && certificate.valid_principals().iter().any(|p| p == user);
+        Ok(if valid && user == "cert" {
+            Auth::Accept
+        } else {
+            Auth::reject()
+        })
+    }
+
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
+        user: &str,
+        _submethods: &str,
+        response: Option<russh::server::Response<'a>>,
+    ) -> Result<Auth, Self::Error> {
+        let answer = response
+            .and_then(|mut r| r.next())
+            .map(|a| String::from_utf8_lossy(&a).into_owned());
+        let (stage, auth) = match (user, self.otp_stage, answer.as_deref()) {
+            ("otp", 0, None) => (0, prompt("", "", "Password: ", false)),
+            ("otp", 0, Some("test")) => (1, otp_prompt()),
+            ("keyotp", 1, None) => (1, otp_prompt()),
+            ("otp" | "keyotp", 1, Some(OTP)) => (2, Auth::Accept),
+            // Asked again, as PAM does after a wrong password.
+            ("otp", 0, Some(_)) => (0, prompt("", "", "Password: ", false)),
+            _ => (self.otp_stage, Auth::reject()),
+        };
+        self.otp_stage = stage;
+        Ok(auth)
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let target = (host_to_connect == "127.0.0.1")
+            .then(|| u16::try_from(port_to_connect).ok())
+            .flatten();
+        let tunnels = self.tunnels.clone();
+        tokio::spawn(async move {
+            let Some(port) = target else {
+                return reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+            };
+            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(mut socket) => {
+                    reply.accept().await;
+                    tunnels.fetch_add(1, Ordering::SeqCst);
+                    let mut stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut socket).await;
+                }
+                Err(_) => reply.reject(russh::ChannelOpenFailure::ConnectFailed).await,
+            }
+        });
+        Ok(())
     }
 
     async fn channel_open_session(

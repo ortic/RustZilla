@@ -24,6 +24,8 @@ fn params(dir: &std::path::Path) -> Option<SshParams> {
         pin: None,
         known_hosts: dir.join("known_hosts"),
         on_touch: None,
+        on_prompt: None,
+        jump: None,
     })
 }
 

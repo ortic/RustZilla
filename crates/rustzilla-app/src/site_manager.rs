@@ -355,6 +355,10 @@ impl SiteManager {
                 });
                 ui.end_row();
 
+                if site.protocol == Protocol::Sftp {
+                    jump_host_row(ui, &mut site.jump_host);
+                }
+
                 ui.label("Logon type:");
                 egui::ComboBox::from_id_salt("logon")
                     .selected_text(site.logon.label())
@@ -509,6 +513,33 @@ impl SiteManager {
         if *self.secrets.get(&id).unwrap_or(&String::new()) != secret {
             self.secrets.insert(id, secret);
         }
+    }
+}
+
+/// The jump host (ProxyJump) of an SFTP site, and what's wrong with it.
+fn jump_host_row(ui: &mut Ui, jump_host: &mut String) {
+    ui.label("Jump host:");
+    ui.add(
+        egui::TextEdit::singleline(jump_host)
+            .hint_text("none, or [user@]host[:port]")
+            .desired_width(220.0),
+    );
+    ui.end_row();
+    match rustzilla_remote::Jump::parse(jump_host) {
+        Err(problem) => {
+            ui.label("");
+            ui.colored_label(ui.visuals().warn_fg_color, problem);
+            ui.end_row();
+        }
+        Ok(Some(_)) => {
+            ui.label("");
+            ui.weak(
+                "Connects through it (ssh -J), logging in with the same credentials; the user \
+                 is the site's if not given.",
+            );
+            ui.end_row();
+        }
+        Ok(None) => {}
     }
 }
 

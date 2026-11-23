@@ -89,7 +89,8 @@ impl App {
                     app.poll_edits();
                 }
             });
-            if free && self.dialog.is_some() {
+            let asks = self.dialog.is_some() || self.tabs[index].prompt.is_some();
+            if free && asks {
                 self.switch_to(index);
             }
         }

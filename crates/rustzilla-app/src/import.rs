@@ -313,6 +313,12 @@ pub fn ssh_config(text: &str) -> Found {
                 .clone()
                 .map(|h| h.replace("%h", alias))
                 .unwrap_or_else(|| alias.clone());
+            // A list of hops: RustZilla goes through one, the first.
+            let jump = block
+                .jump
+                .as_deref()
+                .filter(|j| !j.eq_ignore_ascii_case("none"))
+                .map(|j| j.split(',').next().unwrap_or(j).trim().to_owned());
             let (logon, key_file) = match &block.identity {
                 Some(file) => (Logon::KeyFile, file.clone()),
                 None => (Logon::Agent, String::new()),
@@ -327,13 +333,11 @@ pub fn ssh_config(text: &str) -> Found {
                     user: block.user.clone().unwrap_or_default(),
                     logon,
                     key_file,
+                    jump_host: jump.clone().unwrap_or_default(),
                     ..Site::default()
                 },
                 password: None,
-                jump: block
-                    .jump
-                    .clone()
-                    .filter(|j| !j.eq_ignore_ascii_case("none")),
+                jump: jump.clone(),
             });
         }
     }
@@ -456,6 +460,7 @@ Include ~/.ssh/config.d/*
         );
         assert_eq!(web.site.logon, Logon::KeyFile);
         assert_eq!(web.jump.as_deref(), Some("bastion.example.com"));
+        assert_eq!(web.site.jump_host, "bastion.example.com");
         let bastion = &found.sites[2];
         assert_eq!(
             (bastion.site.host.as_str(), bastion.site.user.as_str()),
