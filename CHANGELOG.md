@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-23
+
 ### Added
 
 - **Tabs**: a connection each, with its own sides and transfers; the queue
@@ -93,5 +95,6 @@ The first release: a FileZilla-like file transfer client on DbCraft's stack.
 - **Polished UI**: hand-drawn SVG icons (file types, folders, transfers,
   security keys), dark and light themes, empty states, clear dialogs.
 
-[Unreleased]: https://github.com/ortic/RustZilla/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ortic/RustZilla/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ortic/RustZilla/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ortic/RustZilla/releases/tag/v0.1.0
