@@ -352,3 +352,22 @@ fn security_key_prompts() {
     save(&mut harness, "about");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn hovering_another_menu_switches_to_it() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut harness = harness(true);
+    harness.get_by_label("File").click();
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Site Manager…").is_some());
+    harness.get_by_label("Help").hover();
+    harness.run_steps(3);
+    assert!(harness.query_by_label("About RustZilla").is_some());
+    assert!(harness.query_by_label("Site Manager…").is_none());
+    // Without a menu open, hovering opens nothing.
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    harness.get_by_label("View").hover();
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Message log").is_none());
+}

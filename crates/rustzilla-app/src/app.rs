@@ -673,7 +673,8 @@ impl App {
 
     fn menu_bar(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
+            let mut menus = Vec::new();
+            let file = ui.menu_button("File", |ui| {
                 ui.set_min_width(200.0);
                 if icons::menu_item(ui, Icon::Server, "Site Manager…", true) {
                     self.open_site_manager(None);
@@ -699,7 +700,8 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
-            ui.menu_button("Transfer", |ui| {
+            menus.push(file.response);
+            let transfer = ui.menu_button("Transfer", |ui| {
                 ui.set_min_width(220.0);
                 ui.weak("If the target file exists:");
                 let mut policy = self.transfers.queue().policy;
@@ -723,7 +725,8 @@ impl App {
                     ui.close();
                 }
             });
-            ui.menu_button("View", |ui| {
+            menus.push(transfer.response);
+            let view = ui.menu_button("View", |ui| {
                 ui.set_min_width(200.0);
                 ui.checkbox(&mut self.settings.show_log, "Message log");
                 ui.separator();
@@ -746,12 +749,15 @@ impl App {
                     ui.close();
                 }
             });
-            ui.menu_button("Help", |ui| {
+            menus.push(view.response);
+            let help = ui.menu_button("Help", |ui| {
                 if icons::menu_item(ui, Icon::Info, "About RustZilla", true) {
                     self.dialog = Some(Dialog::About);
                     ui.close();
                 }
             });
+            menus.push(help.response);
+            switch_menus_on_hover(ctx, &menus);
         });
     }
 
@@ -2165,6 +2171,23 @@ fn log_style(ui: &Ui, kind: LogKind) -> (Icon, Color32) {
             },
         ),
         LogKind::Error => (Icon::Error, ui.visuals().error_fg_color),
+    }
+}
+
+/// While one of the menu bar's menus is open, hovering another one opens
+/// that instead, as in desktop menu bars (egui only opens them on click).
+fn switch_menus_on_hover(ctx: &egui::Context, menus: &[egui::Response]) {
+    use egui::containers::Popup;
+    let id = |r: &egui::Response| Popup::default_response_id(r);
+    if !menus.iter().any(|r| Popup::is_id_open(ctx, id(r))) {
+        return;
+    }
+    if let Some(hovered) = menus
+        .iter()
+        .find(|r| r.hovered() && !Popup::is_id_open(ctx, id(r)))
+    {
+        Popup::open_id(ctx, id(hovered));
+        ctx.request_repaint();
     }
 }
 
