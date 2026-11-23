@@ -87,6 +87,26 @@ jobs:
             mv "$f" "rustzilla${f#RustZilla}"
           done
 
+      # The system in every name: rustzilla_0.1.0_x64-setup.exe ->
+      # rustzilla_0.1.0_windows_x64-setup.exe, rustzilla_0.1.0_amd64.deb ->
+      # rustzilla_0.1.0_linux_amd64.deb, rustzilla_0.1.0_x64.dmg ->
+      # rustzilla_0.1.0_macos_x64.dmg. The archives have it already.
+      - name: Name the packages with their system
+        shell: bash
+        run: |
+          shopt -s nullglob
+          case "${{ runner.os }}" in
+            Linux) os=linux ;;
+            Windows) os=windows ;;
+            macOS) os=macos ;;
+          esac
+          cd dist
+          for f in rustzilla_*; do
+            new=$(echo "$f" | sed -E "s/^rustzilla_([^_]+)_/rustzilla_\1_${os}_/")
+            mv "$f" "$new"
+          done
+          ls
+
       - name: Plain binary archive
         shell: bash
         run: |
