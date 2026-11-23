@@ -6,6 +6,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **WebDAV with HTTP Digest authentication** (RFC 7616: MD5, SHA-256 and
+  their `-sess` variants, `qop=auth`), switched to when the server asks for
+  it, with fresh nonces taken up as they run out.
+- **WebDAV presets** in the Site Manager: Nextcloud and ownCloud fill in
+  HTTPS and their WebDAV folder (Nextcloud's follows the user name).
+- Quickconnect takes a pasted WebDAV URL, such as the one Nextcloud shows
+  (`https://cloud.example.com/remote.php/dav/files/alice/`).
+
+### Changed
+
+- WebDAV over plain HTTP sends the password with Basic only when the server
+  asks for Basic.
+
 ## [0.1.0] - 2026-11-23
 
 The first release: a FileZilla-like file transfer client on DbCraft's stack.

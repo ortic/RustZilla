@@ -561,14 +561,37 @@ impl FtpTestServer {
 }
 
 /// A WebDAV server in the process (dav-server), serving a directory to
-/// `test`/`test` (HTTP Basic).
+/// `test`/`test`: HTTP Basic, or Digest (RFC 7616).
 pub struct WebDavTestServer {
     pub port: u16,
+    digest: Arc<std::sync::Mutex<DigestState>>,
     _runtime: Runtime,
+}
+
+/// How the WebDAV test server logs in.
+#[derive(Clone, Copy, Debug)]
+pub enum DavAuth {
+    Basic,
+    /// Digest, offering these algorithms (`MD5`, `SHA-256-sess`…) in this
+    /// order, with `qop="auth"`.
+    Digest(&'static [&'static str]),
+}
+
+#[derive(Default)]
+struct DigestState {
+    nonce: String,
+    /// Nonces that ran out: `stale=true`.
+    old: Vec<String>,
+    /// A client sent Basic to the Digest server.
+    saw_basic: bool,
 }
 
 impl WebDavTestServer {
     pub fn start(root: &Path) -> Self {
+        Self::start_with(root, DavAuth::Basic)
+    }
+
+    pub fn start_with(root: &Path, auth: DavAuth) -> Self {
         use dav_server::{DavHandler, fakels::FakeLs, localfs::LocalFs};
         use hyper::service::service_fn;
         use hyper_util::rt::TokioIo;
@@ -582,27 +605,44 @@ impl WebDavTestServer {
             .filesystem(LocalFs::new(root, false, false, false))
             .locksystem(FakeLs::new())
             .build_handler();
+        let digest = Arc::new(std::sync::Mutex::new(DigestState {
+            nonce: crate::digest::nonce(),
+            ..Default::default()
+        }));
+        let state = digest.clone();
         runtime.spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let handler = handler.clone();
+                let state = state.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                         let handler = handler.clone();
+                        let state = state.clone();
                         async move {
-                            let authorized = req
-                                .headers()
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                == Some("Basic dGVzdDp0ZXN0");
-                            if !authorized {
+                            let challenge = match auth {
+                                DavAuth::Basic => {
+                                    let authorized = req
+                                        .headers()
+                                        .get("authorization")
+                                        .and_then(|v| v.to_str().ok())
+                                        == Some("Basic dGVzdDp0ZXN0");
+                                    (!authorized).then(|| vec!["Basic realm=\"test\"".to_owned()])
+                                }
+                                DavAuth::Digest(algorithms) => {
+                                    check_digest(&req, &state, algorithms)
+                                }
+                            };
+                            if let Some(challenges) = challenge {
                                 // Read what the client sends first, as servers
                                 // do: answering into an unread body resets the
                                 // connection on Windows.
                                 use http_body_util::BodyExt;
                                 let _ = req.into_body().collect().await;
-                                let response = hyper::Response::builder()
-                                    .status(401)
-                                    .header("WWW-Authenticate", "Basic realm=\"test\"")
+                                let mut response = hyper::Response::builder().status(401);
+                                for challenge in challenges {
+                                    response = response.header("WWW-Authenticate", challenge);
+                                }
+                                let response = response
                                     .body(dav_server::body::Body::from(String::new()))
                                     .expect("a response");
                                 return Ok::<_, std::convert::Infallible>(response);
@@ -618,6 +658,7 @@ impl WebDavTestServer {
         });
         Self {
             port,
+            digest,
             _runtime: runtime,
         }
     }
@@ -632,6 +673,100 @@ impl WebDavTestServer {
             root: "/".into(),
         }
     }
+
+    /// The Digest nonce runs out: the next request is answered
+    /// `stale=true`.
+    pub fn expire_nonce(&self) {
+        let mut state = self.digest.lock().unwrap();
+        let old = std::mem::replace(&mut state.nonce, crate::digest::nonce());
+        state.old.push(old);
+    }
+
+    /// Whether a client sent its password with Basic to the Digest server.
+    pub fn saw_basic(&self) -> bool {
+        self.digest.lock().unwrap().saw_basic
+    }
+}
+
+/// Checks the Digest `Authorization` of `req` (RFC 7616); the challenges
+/// to answer with when it isn't right.
+fn check_digest<B>(
+    req: &hyper::Request<B>,
+    state: &std::sync::Mutex<DigestState>,
+    algorithms: &[&str],
+) -> Option<Vec<String>> {
+    use crate::digest::{Algorithm, Challenge};
+    let mut state = state.lock().unwrap();
+    let header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if header.starts_with("Basic") {
+        state.saw_basic = true;
+    }
+    let params = crate::digest::parse(header)
+        .into_iter()
+        .find(|(scheme, _)| scheme.eq_ignore_ascii_case("digest"))
+        .map(|(_, params)| params)
+        .unwrap_or_default();
+    let get = |name: &str| {
+        params
+            .iter()
+            .find(|(k, _)| k == name)
+            .map_or("", |(_, v)| v.as_str())
+    };
+    let uri = req.uri().path_and_query().map_or("/", |p| p.as_str());
+    let offered = algorithms
+        .iter()
+        .find(|a| a.eq_ignore_ascii_case(get("algorithm")))
+        .and_then(|a| Algorithm::parse(a));
+    let mut stale = false;
+    if let Some(algorithm) = offered
+        && get("username") == "test"
+        && get("realm") == "test"
+        && get("uri") == uri
+        && get("qop") == "auth"
+        && get("opaque") == "opaque"
+        && let Ok(nc) = u32::from_str_radix(get("nc"), 16)
+    {
+        let challenge = Challenge {
+            realm: "test".into(),
+            nonce: get("nonce").into(),
+            opaque: Some("opaque".into()),
+            algorithm,
+            qop: true,
+            stale: false,
+            userhash: false,
+        };
+        let expected = challenge.response(
+            "test",
+            "test",
+            req.method().as_str(),
+            uri,
+            nc,
+            get("cnonce"),
+        );
+        if expected == get("response") {
+            if challenge.nonce == state.nonce {
+                return None;
+            }
+            stale = state.old.contains(&challenge.nonce);
+        }
+    }
+    Some(
+        algorithms
+            .iter()
+            .map(|algorithm| {
+                format!(
+                    "Digest realm=\"test\", qop=\"auth\", algorithm={algorithm}, \
+                     nonce=\"{}\", opaque=\"opaque\"{}",
+                    state.nonce,
+                    if stale { ", stale=true" } else { "" }
+                )
+            })
+            .collect(),
+    )
 }
 
 /// An S3 server in the process (s3s-fs): buckets are the directories of

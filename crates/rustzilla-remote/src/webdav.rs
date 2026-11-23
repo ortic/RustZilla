@@ -6,12 +6,13 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ureq::http::{Request, Response, StatusCode};
 use ureq::{Agent, Body, SendBody};
 
+use crate::digest::{self, Challenge};
 use crate::error::Error;
 use crate::http;
 use crate::path;
@@ -48,11 +49,28 @@ impl fmt::Debug for WebDavParams {
     }
 }
 
+/// How requests log in.
+enum Login {
+    /// No user name: nothing is sent.
+    Anonymous,
+    /// Plain HTTP, before the server asked for something: the password
+    /// isn't sent in the clear unless the server wants Basic.
+    Unknown,
+    Basic,
+    Digest {
+        challenge: Challenge,
+        /// The nonce count of the last request.
+        nc: u32,
+    },
+}
+
 struct Dav {
     agent: Agent,
     /// `https://host:port`
     base: String,
-    authorization: Option<String>,
+    username: String,
+    password: String,
+    login: Mutex<Login>,
     name: String,
     tls: bool,
     root: String,
@@ -93,16 +111,21 @@ impl WebDavServer {
             r if r.starts_with('/') => r.to_owned(),
             r => format!("/{r}"),
         };
-        let authorization = (!params.username.is_empty()).then(|| {
-            format!(
-                "Basic {}",
-                util::base64(format!("{}:{}", params.username, params.password).as_bytes())
-            )
-        });
+        // Over HTTPS Basic goes along at once; a Digest server answers
+        // with its challenge.
+        let login = if params.username.is_empty() {
+            Login::Anonymous
+        } else if params.tls {
+            Login::Basic
+        } else {
+            Login::Unknown
+        };
         let dav = Dav {
             agent: http::agent(),
             base: format!("{scheme}://{authority}"),
-            authorization,
+            username: params.username.clone(),
+            password: params.password.clone(),
+            login: Mutex::new(login),
             name,
             tls: params.tls,
             root,
@@ -176,40 +199,107 @@ impl Dav {
     }
 
     fn request(&self, method: &str, path: &str) -> ureq::http::request::Builder {
-        let mut builder = Request::builder().method(method).uri(self.url(path));
-        if let Some(auth) = &self.authorization {
-            builder = builder.header("Authorization", auth);
-        }
-        builder
+        Request::builder().method(method).uri(self.url(path))
     }
 
-    fn send(
+    /// The request of `builder` with `body`, logged in as we know how.
+    fn build<'a>(
         &self,
         builder: ureq::http::request::Builder,
-        body: SendBody<'_>,
-    ) -> Result<Response<Body>, Error> {
-        let request = builder
+        body: SendBody<'a>,
+    ) -> Result<Request<SendBody<'a>>, Error> {
+        let mut request = builder
             .body(body)
             .map_err(|e| Error::new(format!("{}: {e}", self.name)))?;
-        http::send(&self.agent, request, &self.name)
+        let authorization = match &mut *self.login.lock().unwrap_or_else(|e| e.into_inner()) {
+            Login::Anonymous | Login::Unknown => None,
+            Login::Basic => Some(format!(
+                "Basic {}",
+                util::base64(format!("{}:{}", self.username, self.password).as_bytes())
+            )),
+            Login::Digest { challenge, nc } => {
+                *nc += 1;
+                let uri = request
+                    .uri()
+                    .path_and_query()
+                    .map_or("/", |p| p.as_str())
+                    .to_owned();
+                Some(challenge.authorization(
+                    &self.username,
+                    &self.password,
+                    request.method().as_str(),
+                    &uri,
+                    *nc,
+                    &digest::nonce(),
+                ))
+            }
+        };
+        if let Some(value) = authorization
+            && let Ok(value) = value.parse()
+        {
+            request.headers_mut().insert("Authorization", value);
+        }
+        Ok(request)
+    }
+
+    /// After a 401: learns what the server asks for, and whether the
+    /// request is worth sending again (a first challenge, or a nonce that
+    /// ran out; not a password refused).
+    fn challenged(&self, response: &mut Response<Body>) -> bool {
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return false;
+        }
+        // Read, so the connection can go on.
+        let _ = response
+            .body_mut()
+            .with_config()
+            .limit(64 * 1024)
+            .read_to_vec();
+        let offer = digest::offer(
+            response
+                .headers()
+                .get_all("WWW-Authenticate")
+                .iter()
+                .filter_map(|v| v.to_str().ok()),
+        );
+        let mut login = self.login.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*login, Login::Anonymous) {
+            return false;
+        }
+        match (offer.digest, &*login) {
+            (Some(challenge), Login::Digest { .. }) if !challenge.stale => false,
+            (Some(challenge), _) => {
+                *login = Login::Digest { challenge, nc: 0 };
+                true
+            }
+            (None, Login::Unknown) if offer.basic => {
+                *login = Login::Basic;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Sends a request built by `make` with `body`, once more if the
-    /// connection dropped: everything but PUT can be sent twice.
+    /// connection dropped: everything but PUT can be sent twice. And once
+    /// more logged in if the server asks how.
     fn send_repeatable(
         &self,
         make: impl Fn() -> ureq::http::request::Builder,
         body: Option<&'static [u8]>,
     ) -> Result<Response<Body>, Error> {
-        http::send_repeatable(&self.agent, &self.name, || {
+        let build = || {
             let body = match body {
                 Some(bytes) => SendBody::from_owned_reader(bytes),
                 None => SendBody::none(),
             };
-            make()
-                .body(body)
-                .map_err(|e| Error::new(format!("{}: {e}", self.name)))
-        })
+            self.build(make(), body)
+        };
+        let mut response = http::send_repeatable(&self.agent, &self.name, build)?;
+        if self.challenged(&mut response) {
+            response = http::send_repeatable(&self.agent, &self.name, build)?;
+        }
+        Ok(response)
     }
 
     fn propfind(&self, path: &str, depth: &str) -> Result<Response<Body>, Error> {
@@ -506,29 +596,43 @@ impl Session for WebDavSession {
         _offset: u64,
         progress: Progress,
     ) -> Result<u64, Error> {
-        let file = fs::File::open(local)
-            .map_err(|e| Error::new(format!("opening {}: {e}", local.display())))?;
-        let meta = file
-            .metadata()
-            .map_err(|e| Error::new(format!("reading {}: {e}", local.display())))?;
-        let mut builder = self
-            .dav
-            .request("PUT", remote)
-            .header("Content-Length", meta.len());
-        // Nextcloud and ownCloud keep this as the file's time.
-        if let Ok(modified) = meta.modified() {
-            builder = builder.header("X-OC-Mtime", util::secs(modified));
-        }
-        let mut reader = Counting::new(file, progress);
-        let result = self.dav.send(builder, SendBody::from_reader(&mut reader));
-        if reader.cancelled {
-            return Err(Error::cancelled());
-        }
-        let mut response = result?;
-        if ok(response.status()) {
-            Ok(reader.done)
-        } else {
-            Err(self.dav.fail("writing", remote, &mut response))
+        // The login is known from the PROPFIND of `open`, so a PUT goes
+        // signed. Once more from the start if the server asks again (a
+        // Digest nonce that ran out).
+        let mut first = true;
+        loop {
+            let file = fs::File::open(local)
+                .map_err(|e| Error::new(format!("opening {}: {e}", local.display())))?;
+            let meta = file
+                .metadata()
+                .map_err(|e| Error::new(format!("reading {}: {e}", local.display())))?;
+            let mut builder = self
+                .dav
+                .request("PUT", remote)
+                .header("Content-Length", meta.len());
+            // Nextcloud and ownCloud keep this as the file's time.
+            if let Ok(modified) = meta.modified() {
+                builder = builder.header("X-OC-Mtime", util::secs(modified));
+            }
+            let mut reader = Counting::new(file, &mut *progress);
+            let result = self
+                .dav
+                .build(builder, SendBody::from_reader(&mut reader))
+                .and_then(|request| http::send(&self.dav.agent, request, &self.dav.name));
+            if reader.cancelled {
+                return Err(Error::cancelled());
+            }
+            let done = reader.done;
+            let mut response = result?;
+            if first && self.dav.challenged(&mut response) {
+                first = false;
+                continue;
+            }
+            return if ok(response.status()) {
+                Ok(done)
+            } else {
+                Err(self.dav.fail("writing", remote, &mut response))
+            };
         }
     }
 }

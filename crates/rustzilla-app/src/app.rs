@@ -2827,7 +2827,8 @@ fn buttons(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 }
 
 /// What the Quickconnect host field holds: `host`, `host:port`,
-/// `sftp://user@host:port/path`.
+/// `sftp://user@host:port/path`, or a WebDAV URL as Nextcloud shows it
+/// (`https://cloud.example.com/remote.php/dav/files/alice/`).
 #[derive(Debug, PartialEq, Eq)]
 struct Target {
     /// From the scheme: `sftp://`, `ftp://`, `ftps://` (implicit TLS),
@@ -2856,6 +2857,9 @@ fn parse_host(input: &str) -> Option<Target> {
         ("webdavs://", Protocol::WebDav, FtpEncryption::Explicit),
         ("webdav://", Protocol::WebDav, FtpEncryption::Plain),
         ("s3://", Protocol::S3, FtpEncryption::Explicit),
+        // A pasted URL: WebDAV.
+        ("https://", Protocol::WebDav, FtpEncryption::Explicit),
+        ("http://", Protocol::WebDav, FtpEncryption::Plain),
     ] {
         if let Some(stripped) = rest.strip_prefix(prefix) {
             rest = stripped;
@@ -2882,13 +2886,50 @@ fn parse_host(input: &str) -> Option<Target> {
     if host.is_empty() {
         return None;
     }
+    let mut path = path.filter(|p| p != "/" || rest.ends_with('/'));
+    let mut user = user;
+    if input.trim().starts_with("http") {
+        // A URL's path is percent-encoded; Nextcloud's names the user.
+        path = path.map(|p| percent_decode(&p));
+        if user.is_none() {
+            user = path
+                .as_deref()
+                .and_then(|p| p.strip_prefix("/remote.php/dav/files/"))
+                .and_then(|p| p.split('/').next())
+                .filter(|u| !u.is_empty())
+                .map(str::to_owned);
+        }
+    }
     Some(Target {
         scheme,
         host: host.to_owned(),
         port,
         user,
-        path: path.filter(|p| p != "/" || rest.ends_with('/')),
+        path,
     })
+}
+
+/// `%XX` decoded (UTF-8).
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = text
+            .get(i + 1..i + 3)
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -2938,6 +2979,20 @@ mod tests {
                 Some((protocol, encryption))
             );
         }
+        let t =
+            parse_host("https://cloud.example.com/remote.php/dav/files/a%40b.org/Photos/").unwrap();
+        assert_eq!(t.scheme, Some((Protocol::WebDav, FtpEncryption::Explicit)));
+        assert_eq!((t.host.as_str(), t.port), ("cloud.example.com", None));
+        assert_eq!(
+            (t.user.as_deref(), t.path.as_deref()),
+            (
+                Some("a@b.org"),
+                Some("/remote.php/dav/files/a@b.org/Photos/")
+            )
+        );
+        let t = parse_host("http://nas:8080/webdav").unwrap();
+        assert_eq!(t.scheme, Some((Protocol::WebDav, FtpEncryption::Plain)));
+        assert_eq!((t.port, t.user), (Some(8080), None));
         let ipv6 = parse_host("[::1]:22").unwrap();
         assert_eq!((ipv6.host.as_str(), ipv6.port), ("::1", Some(22)));
         assert!(parse_host("  ").is_none());

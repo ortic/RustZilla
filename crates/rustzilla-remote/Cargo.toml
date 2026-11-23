@@ -33,6 +33,8 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"], o
 http-body-util = { version = "0.1", optional = true }
 # Certificate fingerprints, and CTAP2's hashes (see below).
 ring.workspace = true
+# HTTP Digest authentication (MD5; SHA-256 is ring's).
+md-5 = "0.11"
 jiff = { version = "1", default-features = false, features = ["std"] }
 russh.workspace = true
 russh-sftp.workspace = true

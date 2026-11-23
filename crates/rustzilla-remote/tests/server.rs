@@ -119,6 +119,51 @@ fn webdav_round_trip() {
 }
 
 #[test]
+fn webdav_digest_round_trip() {
+    use rustzilla_remote::testserver::{DavAuth, WebDavTestServer};
+    for (i, algorithms) in [&["MD5"][..], &["SHA-256-sess", "MD5"][..]]
+        .into_iter()
+        .enumerate()
+    {
+        let dir =
+            std::env::temp_dir().join(format!("rustzilla-dav-digest{i}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("served/upload")).unwrap();
+        let server = WebDavTestServer::start_with(&dir.join("served"), DavAuth::Digest(algorithms));
+        let mut wrong = server.params();
+        wrong.password = "nope".into();
+        let error = rustzilla_remote::connect(&Params::WebDav(wrong))
+            .err()
+            .unwrap();
+        assert!(error.message.contains("didn't accept"), "{error}");
+
+        let connection = rustzilla_remote::connect(&Params::WebDav(server.params())).unwrap();
+        let mut session = connection.open().unwrap();
+        // A nonce that runs out: a listing and an upload go again.
+        server.expire_nonce();
+        session.list("/").unwrap();
+        server.expire_nonce();
+        let local = dir.join("small.txt");
+        fs::write(&local, b"digest").unwrap();
+        let sent = session
+            .upload(&local, "/upload/small.txt", 0, &mut |_| true)
+            .unwrap();
+        assert_eq!(sent, 6);
+        assert_eq!(
+            fs::read(dir.join("served/upload/small.txt")).unwrap(),
+            b"digest"
+        );
+        session.remove_file("/upload/small.txt").unwrap();
+        connection.disconnect();
+
+        common::round_trip(Params::WebDav(server.params()), &dir, common::BASIC);
+        // The password never went in the clear.
+        assert!(!server.saw_basic());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn s3_round_trip() {
     use rustzilla_remote::testserver::S3TestServer;
     let dir = std::env::temp_dir().join(format!("rustzilla-s3-{}", std::process::id()));

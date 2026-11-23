@@ -8,7 +8,7 @@ use egui::{RichText, Ui};
 
 use rustzilla_remote::{FtpEncryption, Protocol};
 
-use crate::config::{Logon, Site};
+use crate::config::{DavPreset, Logon, Site};
 use crate::icons::{self, Icon};
 use crate::secrets;
 use crate::theme;
@@ -260,6 +260,7 @@ impl SiteManager {
         });
         let mut secret = self.secret(&id).clone();
         let site = &mut self.sites[index];
+        let user_before = site.user.clone();
         egui::Grid::new("site-form")
             .num_columns(2)
             .spacing([12.0, 8.0])
@@ -308,6 +309,27 @@ impl SiteManager {
                             );
                         });
                         ui.end_row();
+                    }
+                }
+                if site.protocol == Protocol::WebDav {
+                    ui.label("Preset:");
+                    let preset = site.preset;
+                    egui::ComboBox::from_id_salt("preset")
+                        .selected_text(site.preset.label())
+                        .width(300.0)
+                        .show_ui(ui, |ui| {
+                            for preset in DavPreset::ALL {
+                                ui.selectable_value(&mut site.preset, preset, preset.label());
+                            }
+                        });
+                    ui.end_row();
+                    // Nextcloud and ownCloud: HTTPS, and their folder.
+                    if site.preset != preset
+                        && let Some(folder) = site.preset.folder(&site.user)
+                    {
+                        site.encryption = FtpEncryption::Explicit;
+                        site.port = 443;
+                        site.remote_dir = folder;
                     }
                 }
                 // The default port follows the protocol, unless one was set.
@@ -447,6 +469,15 @@ impl SiteManager {
                     Logon::AskPassword | Logon::Anonymous => {}
                 }
 
+                // Nextcloud's folder follows the user, unless changed.
+                if site.protocol == Protocol::WebDav
+                    && site.user != user_before
+                    && let Some(old) = site.preset.folder(&user_before)
+                    && site.remote_dir == old
+                    && let Some(folder) = site.preset.folder(&site.user)
+                {
+                    site.remote_dir = folder;
+                }
                 let (label, hint) = match site.protocol {
                     Protocol::WebDav => ("WebDAV folder:", "/remote.php/dav/files/USER (Nextcloud)"),
                     Protocol::S3 => ("Remote directory:", "/bucket/folder (empty: all buckets)"),
