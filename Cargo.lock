@@ -5422,6 +5422,7 @@ dependencies = [
  "jiff 1.0.2",
  "libc",
  "libunftp",
+ "md-5",
  "rcgen",
  "ring",
  "roxmltree 0.21.2",

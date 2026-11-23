@@ -87,6 +87,42 @@ impl Logon {
     }
 }
 
+/// The kind of WebDAV server, for its folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DavPreset {
+    #[default]
+    Generic,
+    Nextcloud,
+    #[serde(rename = "owncloud")]
+    OwnCloud,
+}
+
+impl DavPreset {
+    pub const ALL: [DavPreset; 3] = [
+        DavPreset::Generic,
+        DavPreset::Nextcloud,
+        DavPreset::OwnCloud,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DavPreset::Generic => "Generic",
+            DavPreset::Nextcloud => "Nextcloud",
+            DavPreset::OwnCloud => "ownCloud",
+        }
+    }
+
+    /// The WebDAV folder of `user` on such a server.
+    pub fn folder(self, user: &str) -> Option<String> {
+        match self {
+            DavPreset::Generic => None,
+            DavPreset::Nextcloud => Some(format!("/remote.php/dav/files/{}/", user.trim())),
+            DavPreset::OwnCloud => Some("/remote.php/webdav/".into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Site {
@@ -106,6 +142,8 @@ pub struct Site {
     pub remote_dir: String,
     /// S3's region, e.g. `eu-central-1`.
     pub region: String,
+    /// WebDAV's kind of server (Nextcloud, ownCloud).
+    pub preset: DavPreset,
     /// Opened on the local side after connecting, if set.
     pub local_dir: String,
 }
@@ -124,6 +162,7 @@ impl Default for Site {
             key_file: String::new(),
             remote_dir: String::new(),
             region: String::new(),
+            preset: DavPreset::Generic,
             local_dir: String::new(),
         }
     }
@@ -191,5 +230,23 @@ mod tests {
         save_sites(&paths, &sites).unwrap();
         assert_eq!(load_sites(&paths).unwrap(), sites);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn presets() {
+        // Sites saved before presets load as Generic.
+        let file: SitesFile =
+            toml::from_str("[[site]]\nname = \"old\"\nprotocol = \"webdav\"\n").unwrap();
+        assert_eq!(file.sites[0].preset, DavPreset::Generic);
+        let site = Site {
+            preset: DavPreset::OwnCloud,
+            ..Site::default()
+        };
+        let text = toml::to_string(&SitesFile { sites: vec![site] }).unwrap();
+        assert!(text.contains("preset = \"owncloud\""), "{text}");
+        assert_eq!(
+            DavPreset::Nextcloud.folder("alice").as_deref(),
+            Some("/remote.php/dav/files/alice/")
+        );
     }
 }
