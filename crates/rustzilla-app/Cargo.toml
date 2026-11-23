@@ -71,6 +71,7 @@ main = true
 [package.metadata.packager.deb]
 desktopTemplate = "../../assets/linux/com.ortic.rustzilla.desktop"
 section = "net"
+packageName = "rustzilla"
 
 [package.metadata.packager.deb.files]
 "../../assets/linux/com.ortic.rustzilla.metainfo.xml" = "usr/share/metainfo/com.ortic.rustzilla.metainfo.xml"
