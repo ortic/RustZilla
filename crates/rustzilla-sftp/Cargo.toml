@@ -1,0 +1,43 @@
+[package]
+name = "rustzilla-sftp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# An SFTP server in the process (testserver.rs), for the tests of the app.
+test-server = []
+
+[dependencies]
+russh.workspace = true
+russh-sftp.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# Security keys: CTAP2 over USB HID on Linux and macOS. The tests run it
+# against a key in software everywhere.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+aes.workspace = true
+ring.workspace = true
+
+[target.'cfg(not(any(target_os = "linux", target_os = "macos")))'.dev-dependencies]
+aes.workspace = true
+ring.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+hidapi.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Networking_WindowsWebServices",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+rustzilla-sftp = { path = ".", features = ["test-server"] }

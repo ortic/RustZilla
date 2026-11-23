@@ -1,0 +1,37 @@
+[package]
+name = "rustzilla-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A fast, native SFTP client"
+authors = ["Remo Laubacher"]
+
+[[bin]]
+name = "rustzilla"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+directories.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras = { workspace = true, features = ["svg"] }
+# Draws the window icon from assets/icon/rustzilla.svg.
+resvg = { version = "0.45", default-features = false }
+keyring.workspace = true
+rfd = "0.17"
+rustzilla-sftp.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Under WSLg the window opens through X11 (main.rs), as in DbCraft.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["x11"] }
+
+[dev-dependencies]
+rustzilla-sftp = { workspace = true, features = ["test-server"] }
+egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }

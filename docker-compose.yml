@@ -1,0 +1,11 @@
+# An OpenSSH SFTP server for the integration tests and to try RustZilla:
+#   docker compose up -d
+#   RUSTZILLA_TEST_SFTP=1 cargo test -p rustzilla-sftp --test openssh
+# User `rustzilla`, password `rustzilla`, on 127.0.0.1:2222; it can write
+# in /upload.
+services:
+  sftp:
+    image: atmoz/sftp:alpine
+    ports:
+      - "127.0.0.1:2222:22"
+    command: rustzilla:rustzilla:::upload

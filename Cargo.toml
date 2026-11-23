@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+rustzilla-sftp = { path = "crates/rustzilla-sftp" }
+
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "glow", "default_fonts", "accesskit", "wayland", "x11", "persistence"] }
+egui = "0.36"
+egui_extras = "0.36"
+# SSH: pure Rust on ring, as in DbCraft. Its tokio runtime carries the SSH
+# connection; the app talks to it from worker threads.
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
+russh-sftp = "4"
+# Security keys (`ecdsa-sk`, `ed25519-sk` key files): the hashes, ECDH and
+# HMAC of CTAP2's PIN protocols on the ring russh uses, and its AES. hidapi
+# reaches the keys on macOS only (Linux reads hidraw, Windows has WebAuthn).
+ring = "0.17"
+aes = "0.9"
+hidapi = { version = "2.6", default-features = false }
+libc = "0.2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+directories = "6"
+windows-sys = { version = "0.61" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+keyring = "4"
+anyhow = "1"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
