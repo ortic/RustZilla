@@ -54,6 +54,31 @@ fn roots() -> RootCerts {
         .clone()
 }
 
+/// Whether a request failed because the connection dropped before the
+/// answer: a server closing a kept-alive connection, or answering early
+/// (a 401 before the body) and resetting. A repeatable request may be sent
+/// again.
+pub(crate) fn dropped(e: &ureq::Error) -> bool {
+    matches!(e, ureq::Error::Io(_) | ureq::Error::ConnectionFailed)
+}
+
+/// Runs a request that can be sent twice (`make` builds it again), once
+/// more if the connection dropped.
+pub(crate) fn send_repeatable(
+    agent: &Agent,
+    server: &str,
+    make: impl Fn() -> Result<Request<SendBody<'static>>, Error>,
+) -> Result<Response<Body>, Error> {
+    match agent.run(make()?) {
+        Ok(response) => Ok(response),
+        Err(e) if dropped(&e) => {
+            tracing::debug!("{server}: {e}; sending the request again");
+            agent.run(make()?).map_err(|e| network_error(server, &e))
+        }
+        Err(e) => Err(network_error(server, &e)),
+    }
+}
+
 /// Runs a request; network failures say what couldn't be reached.
 pub(crate) fn send(
     agent: &Agent,

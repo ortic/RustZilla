@@ -595,6 +595,11 @@ impl WebDavTestServer {
                                 .and_then(|v| v.to_str().ok())
                                 == Some("Basic dGVzdDp0ZXN0");
                             if !authorized {
+                                // Read what the client sends first, as servers
+                                // do: answering into an unread body resets the
+                                // connection on Windows.
+                                use http_body_util::BodyExt;
+                                let _ = req.into_body().collect().await;
                                 let response = hyper::Response::builder()
                                     .status(401)
                                     .header("WWW-Authenticate", "Basic realm=\"test\"")

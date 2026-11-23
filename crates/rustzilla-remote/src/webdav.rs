@@ -194,12 +194,33 @@ impl Dav {
         http::send(&self.agent, request, &self.name)
     }
 
+    /// Sends a request built by `make` with `body`, once more if the
+    /// connection dropped: everything but PUT can be sent twice.
+    fn send_repeatable(
+        &self,
+        make: impl Fn() -> ureq::http::request::Builder,
+        body: Option<&'static [u8]>,
+    ) -> Result<Response<Body>, Error> {
+        http::send_repeatable(&self.agent, &self.name, || {
+            let body = match body {
+                Some(bytes) => SendBody::from_owned_reader(bytes),
+                None => SendBody::none(),
+            };
+            make()
+                .body(body)
+                .map_err(|e| Error::new(format!("{}: {e}", self.name)))
+        })
+    }
+
     fn propfind(&self, path: &str, depth: &str) -> Result<Response<Body>, Error> {
-        let builder = self
-            .request("PROPFIND", path)
-            .header("Depth", depth)
-            .header("Content-Type", "application/xml; charset=utf-8");
-        self.send(builder, SendBody::from_reader(&mut PROPFIND.as_bytes()))
+        self.send_repeatable(
+            || {
+                self.request("PROPFIND", path)
+                    .header("Depth", depth)
+                    .header("Content-Type", "application/xml; charset=utf-8")
+            },
+            Some(PROPFIND.as_bytes()),
+        )
     }
 
     /// The entries of a PROPFIND reply, by their decoded paths.
@@ -355,7 +376,7 @@ impl Session for WebDavSession {
     fn mkdir(&mut self, path: &str) -> Result<(), Error> {
         let mut response = self
             .dav
-            .send(self.dav.request("MKCOL", path), SendBody::none())?;
+            .send_repeatable(|| self.dav.request("MKCOL", path), None)?;
         if ok(response.status()) {
             Ok(())
         } else {
@@ -366,7 +387,7 @@ impl Session for WebDavSession {
     fn remove_file(&mut self, path: &str) -> Result<(), Error> {
         let mut response = self
             .dav
-            .send(self.dav.request("DELETE", path), SendBody::none())?;
+            .send_repeatable(|| self.dav.request("DELETE", path), None)?;
         if ok(response.status()) {
             Ok(())
         } else {
@@ -384,12 +405,15 @@ impl Session for WebDavSession {
     }
 
     fn rename(&mut self, from: &str, to: &str) -> Result<(), Error> {
-        let builder = self
-            .dav
-            .request("MOVE", from)
-            .header("Destination", self.dav.url(to))
-            .header("Overwrite", "F");
-        let mut response = self.dav.send(builder, SendBody::none())?;
+        let mut response = self.dav.send_repeatable(
+            || {
+                self.dav
+                    .request("MOVE", from)
+                    .header("Destination", self.dav.url(to))
+                    .header("Overwrite", "F")
+            },
+            None,
+        )?;
         if ok(response.status()) {
             Ok(())
         } else {
@@ -412,11 +436,17 @@ impl Session for WebDavSession {
     ) -> Result<u64, Error> {
         let local_error =
             |what: &str, e: io::Error| Error::new(format!("{what} {}: {e}", local.display()));
-        let mut builder = self.dav.request("GET", remote);
-        if offset > 0 {
-            builder = builder.header("Range", format!("bytes={offset}-"));
-        }
-        let mut response = self.dav.send(builder, SendBody::none())?;
+        let mut response = self.dav.send_repeatable(
+            || {
+                let builder = self.dav.request("GET", remote);
+                if offset > 0 {
+                    builder.header("Range", format!("bytes={offset}-"))
+                } else {
+                    builder
+                }
+            },
+            None,
+        )?;
         let status = response.status().as_u16();
         if status == 416 {
             // Nothing after `offset`: the file is complete.

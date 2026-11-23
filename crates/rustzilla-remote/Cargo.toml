@@ -16,6 +16,7 @@ test-server = [
     "dep:s3s-fs",
     "dep:hyper",
     "dep:hyper-util",
+    "dep:http-body-util",
 ]
 
 [dependencies]
@@ -29,6 +30,7 @@ s3s = { version = "0.17", optional = true }
 s3s-fs = { version = "0.17", default-features = false, optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 # Certificate fingerprints, and CTAP2's hashes (see below).
 ring.workspace = true
 jiff = { version = "1", default-features = false, features = ["std"] }

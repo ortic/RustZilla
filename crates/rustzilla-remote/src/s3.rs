@@ -194,7 +194,8 @@ impl S3 {
     }
 
     /// Signs and sends a request; once more in the bucket's own region if
-    /// the store says it is elsewhere.
+    /// the store says it is elsewhere, or if the connection dropped and
+    /// there is no body.
     fn request(
         &self,
         method: &str,
@@ -208,7 +209,25 @@ impl S3 {
         let region = self.region_of(bucket.as_deref());
         // A body that is a reader can't be sent twice: only bodiless
         // requests are retried in another region.
-        let response = self.signed(method, uri, query, headers, payload_hash, body, &region)?;
+        let response =
+            match self.signed(method, uri, query, headers, payload_hash, body, &region)? {
+                Ok(response) => response,
+                // A request without a body can be signed and sent again.
+                Err(e) if payload_hash == EMPTY_SHA256 && http::dropped(&e) => {
+                    tracing::debug!("{}: {e}; sending the request again", self.name);
+                    self.signed(
+                        method,
+                        uri,
+                        query,
+                        headers,
+                        payload_hash,
+                        SendBody::none(),
+                        &region,
+                    )?
+                    .map_err(|e| http::network_error(&self.name, &e))?
+                }
+                Err(e) => return Err(http::network_error(&self.name, &e)),
+            };
         let elsewhere = response
             .headers()
             .get("x-amz-bucket-region")
@@ -229,7 +248,8 @@ impl S3 {
                     payload_hash,
                     SendBody::none(),
                     &other,
-                )
+                )?
+                .map_err(|e| http::network_error(&self.name, &e))
             }
             _ => Ok(response),
         }
@@ -245,7 +265,7 @@ impl S3 {
         payload_hash: &str,
         body: SendBody<'_>,
         region: &str,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Result<Response<Body>, ureq::Error>, Error> {
         let (amz_date, date) = util::amz_date(util::secs(SystemTime::now()));
         let mut query: Vec<(String, String)> = query
             .iter()
@@ -315,7 +335,8 @@ impl S3 {
         let request = builder
             .body(body)
             .map_err(|e| Error::new(format!("{}: {e}", self.name)))?;
-        http::send(&self.agent, request, &self.name)
+        // The network's errors go to the caller, which may send again.
+        Ok(self.agent.run(request))
     }
 
     /// `/bucket/key` as a signed URI path.
