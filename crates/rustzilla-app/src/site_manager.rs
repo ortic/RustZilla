@@ -17,7 +17,7 @@ pub enum Outcome {
     /// Save the sites (and close, unless also connecting).
     Save(Vec<Site>),
     /// Save, then connect to the site.
-    SaveAndConnect(Vec<Site>, Site, Option<String>),
+    SaveAndConnect(Vec<Site>, Box<Site>, Option<String>),
     Close,
 }
 
@@ -142,7 +142,11 @@ impl SiteManager {
                         if let Err(e) = self.save_secrets() {
                             tracing::warn!("{e}");
                         }
-                        outcome = Some(Outcome::SaveAndConnect(self.sites.clone(), site, secret));
+                        outcome = Some(Outcome::SaveAndConnect(
+                            self.sites.clone(),
+                            Box::new(site),
+                            secret,
+                        ));
                     }
                 });
             });
@@ -275,17 +279,21 @@ impl SiteManager {
                         }
                     });
                 ui.end_row();
-                if site.protocol == Protocol::Ftp {
+                if !site.protocol.encryptions().is_empty() {
+                    // HTTP protocols choose between HTTPS and HTTP.
+                    if !site.protocol.encryptions().contains(&site.encryption) {
+                        site.encryption = site.protocol.encryptions()[0];
+                    }
                     ui.label("Encryption:");
                     egui::ComboBox::from_id_salt("encryption")
-                        .selected_text(site.encryption.label())
+                        .selected_text(site.encryption.label_for(site.protocol))
                         .width(300.0)
                         .show_ui(ui, |ui| {
-                            for encryption in FtpEncryption::ALL {
+                            for &encryption in site.protocol.encryptions() {
                                 ui.selectable_value(
                                     &mut site.encryption,
                                     encryption,
-                                    encryption.label(),
+                                    encryption.label_for(site.protocol),
                                 );
                             }
                         });
@@ -336,15 +344,26 @@ impl SiteManager {
                     });
                 ui.end_row();
 
+                if site.protocol == Protocol::S3 {
+                    ui.label("Region:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut site.region)
+                            .hint_text("us-east-1")
+                            .desired_width(220.0),
+                    );
+                    ui.end_row();
+                }
+
+                let s3 = site.protocol == Protocol::S3;
                 if site.logon != Logon::Anonymous {
-                    ui.label("User:");
+                    ui.label(if s3 { "Access key ID:" } else { "User:" });
                     ui.add(egui::TextEdit::singleline(&mut site.user).desired_width(220.0));
                     ui.end_row();
                 }
 
                 match site.logon {
                     Logon::Normal => {
-                        ui.label("Password:");
+                        ui.label(if s3 { "Secret key:" } else { "Password:" });
                         ui.add(
                             egui::TextEdit::singleline(&mut secret)
                                 .password(true)
@@ -428,10 +447,15 @@ impl SiteManager {
                     Logon::AskPassword | Logon::Anonymous => {}
                 }
 
-                ui.label("Remote directory:");
+                let (label, hint) = match site.protocol {
+                    Protocol::WebDav => ("WebDAV folder:", "/remote.php/dav/files/USER (Nextcloud)"),
+                    Protocol::S3 => ("Remote directory:", "/bucket/folder (empty: all buckets)"),
+                    _ => ("Remote directory:", "home directory"),
+                };
+                ui.label(label);
                 ui.add(
                     egui::TextEdit::singleline(&mut site.remote_dir)
-                        .hint_text("home directory")
+                        .hint_text(hint)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();

@@ -7,18 +7,35 @@ rust-version.workspace = true
 
 [features]
 # An SFTP server in the process (testserver.rs), for the tests of the app.
-test-server = ["dep:libunftp", "dep:unftp-sbe-fs", "dep:rcgen"]
+test-server = [
+    "dep:libunftp",
+    "dep:unftp-sbe-fs",
+    "dep:rcgen",
+    "dep:dav-server",
+    "dep:s3s",
+    "dep:s3s-fs",
+    "dep:hyper",
+    "dep:hyper-util",
+]
 
 [dependencies]
 # The FTP(S) server of the tests (test-server feature).
 libunftp = { version = "0.25", default-features = false, features = ["ring"], optional = true }
 unftp-sbe-fs = { version = "0.4", optional = true }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"], optional = true }
+# The WebDAV and S3 servers of the tests.
+dav-server = { version = "0.12", default-features = false, features = ["localfs"], optional = true }
+s3s = { version = "0.17", optional = true }
+s3s-fs = { version = "0.17", default-features = false, optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"], optional = true }
 # Certificate fingerprints, and CTAP2's hashes (see below).
 ring.workspace = true
 jiff = { version = "1", default-features = false, features = ["std"] }
 russh.workspace = true
 russh-sftp.workspace = true
+# WebDAV's and S3's XML.
+roxmltree = "0.21"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 serde.workspace = true
@@ -26,6 +43,8 @@ serde.workspace = true
 suppaftp = { version = "13", default-features = false, features = ["rustls-ring", "deprecated"] }
 tokio.workspace = true
 tracing.workspace = true
+# HTTP for WebDAV and S3: blocking, rustls on ring.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 webpki-roots = "1"
 # The subject, issuer and validity of certificates to trust.
 x509-parser = "0.18"

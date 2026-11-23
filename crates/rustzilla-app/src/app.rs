@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use rustzilla_remote::{
     Auth, Certificate, ErrorKind, FtpEncryption, FtpParams, HostKey, Params, Protocol, RemoteEntry,
-    Security, Server, SshParams, path,
+    S3Params, Security, Server, SshParams, WebDavParams, path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +79,20 @@ struct LogLine {
     time: String,
     kind: LogKind,
     text: String,
+}
+
+/// What a login needs, whatever the protocol.
+struct Login {
+    protocol: Protocol,
+    encryption: FtpEncryption,
+    host: String,
+    port: u16,
+    username: String,
+    auth: Auth,
+    /// WebDAV's folder.
+    folder: String,
+    /// S3's region.
+    region: String,
 }
 
 /// A connect, kept to try again with what the user adds (a trusted host
@@ -255,15 +269,22 @@ impl App {
     }
 
     /// The parameters of a login, by protocol.
-    fn params(
-        &self,
-        protocol: Protocol,
-        encryption: FtpEncryption,
-        host: String,
-        port: u16,
-        username: String,
-        auth: Auth,
-    ) -> Params {
+    fn params(&self, login: Login) -> Params {
+        let Login {
+            protocol,
+            encryption,
+            host,
+            port,
+            username,
+            auth,
+            folder,
+            region,
+        } = login;
+        let password = match &auth {
+            Auth::Password(p) => p.clone(),
+            _ => String::new(),
+        };
+        let tls = protocol.uses_tls(encryption);
         match protocol {
             Protocol::Sftp => Params::Sftp(SshParams {
                 host,
@@ -278,12 +299,25 @@ impl App {
                 host,
                 port,
                 username,
-                password: match auth {
-                    Auth::Password(p) => p,
-                    _ => String::new(),
-                },
+                password,
                 encryption,
                 trusted_certs: self.trusted_certs(),
+            }),
+            Protocol::WebDav => Params::WebDav(WebDavParams {
+                host,
+                port,
+                tls,
+                username,
+                password,
+                root: folder,
+            }),
+            Protocol::S3 => Params::S3(S3Params {
+                host,
+                port,
+                tls,
+                region,
+                access_key: username,
+                secret_key: password,
             }),
         }
     }
@@ -315,7 +349,17 @@ impl App {
             (Protocol::Sftp, true) => Auth::Agent,
             _ => Auth::Password(self.quick_password.clone()),
         };
-        let params = self.params(protocol, encryption, target.host, port, user, auth);
+        let folder = target.path.clone().unwrap_or_default();
+        let params = self.params(Login {
+            protocol,
+            encryption,
+            host: target.host,
+            port,
+            username: user,
+            auth,
+            folder,
+            region: String::new(),
+        });
         self.connect(
             ctx,
             Attempt {
@@ -346,14 +390,16 @@ impl App {
             site.user.trim().to_owned()
         };
         let attempt = Attempt {
-            params: self.params(
-                site.protocol,
-                site.encryption,
-                site.host.trim().to_owned(),
-                site.port,
-                user,
+            params: self.params(Login {
+                protocol: site.protocol,
+                encryption: site.encryption,
+                host: site.host.trim().to_owned(),
+                port: site.port,
+                username: user,
                 auth,
-            ),
+                folder: site.remote_dir.trim().to_owned(),
+                region: site.region.trim().to_owned(),
+            }),
             remote_dir: site.remote_dir.clone(),
         };
         if site.logon == Logon::AskPassword {
@@ -949,6 +995,12 @@ impl App {
                 &mut self.settings.quick_host,
                 "sftp://example.com",
                 200.0,
+            )
+            .on_hover_text(
+                "sftp://host  ·  ftp://host (TLS if available)  ·  ftpes://host (explicit TLS)  ·  \
+                 ftps://host (implicit TLS)  ·  davs://host/folder (WebDAV)  ·  \
+                 s3://endpoint (S3; access key as user, secret key as password)\n\
+                 Without a scheme: port 21 is FTP, 990 FTPS, anything else SFTP.",
             );
             let user = field(ui, "Username", &mut self.settings.quick_user, "", 120.0);
             ui.label(RichText::new("Password").color(ui.visuals().weak_text_color()));
@@ -1222,10 +1274,20 @@ impl App {
         ui.horizontal(|ui| {
             match (&self.state, &self.connection) {
                 (ConnState::Connected, Some(c)) => {
-                    let (secure, kind) = match c.security() {
-                        Security::Ssh => (true, "SFTP"),
-                        Security::Tls => (true, "FTP over TLS"),
-                        Security::Plain => (false, "FTP, not encrypted"),
+                    let protocol = self
+                        .attempt
+                        .as_ref()
+                        .map_or(Protocol::Sftp, |a| a.params.protocol());
+                    let (secure, kind) = match (c.security(), protocol) {
+                        (Security::Ssh, _) => (true, "SFTP"),
+                        (Security::Tls, Protocol::Ftp) => (true, "FTP over TLS"),
+                        (Security::Tls, Protocol::WebDav) => (true, "WebDAV over HTTPS"),
+                        (Security::Tls, _) => (true, "S3 over HTTPS"),
+                        (Security::Plain, Protocol::Ftp) => (false, "FTP, not encrypted"),
+                        (Security::Plain, Protocol::WebDav) => {
+                            (false, "WebDAV over HTTP, not encrypted")
+                        }
+                        (Security::Plain, _) => (false, "S3 over HTTP, not encrypted"),
                     };
                     if secure {
                         ui.add(
@@ -2374,6 +2436,11 @@ fn parse_host(input: &str) -> Option<Target> {
         ("ftp://", Protocol::Ftp, FtpEncryption::ExplicitIfAvailable),
         ("ftps://", Protocol::Ftp, FtpEncryption::Implicit),
         ("ftpes://", Protocol::Ftp, FtpEncryption::Explicit),
+        ("davs://", Protocol::WebDav, FtpEncryption::Explicit),
+        ("dav://", Protocol::WebDav, FtpEncryption::Plain),
+        ("webdavs://", Protocol::WebDav, FtpEncryption::Explicit),
+        ("webdav://", Protocol::WebDav, FtpEncryption::Plain),
+        ("s3://", Protocol::S3, FtpEncryption::Explicit),
     ] {
         if let Some(stripped) = rest.strip_prefix(prefix) {
             rest = stripped;
@@ -2437,6 +2504,17 @@ mod tests {
             (
                 "ftpes://example.com",
                 Protocol::Ftp,
+                FtpEncryption::Explicit,
+            ),
+            (
+                "davs://example.com",
+                Protocol::WebDav,
+                FtpEncryption::Explicit,
+            ),
+            ("dav://example.com", Protocol::WebDav, FtpEncryption::Plain),
+            (
+                "s3://s3.amazonaws.com",
+                Protocol::S3,
                 FtpEncryption::Explicit,
             ),
         ] {

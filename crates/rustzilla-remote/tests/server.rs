@@ -14,7 +14,7 @@ fn test_server_round_trip() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("served/upload")).unwrap();
     let server = TestServer::start(&dir.join("served"), &dir.join("known_hosts"));
-    common::round_trip(Params::Sftp(server.params()), &dir, true);
+    common::round_trip(Params::Sftp(server.params()), &dir, common::ALL);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -70,7 +70,7 @@ fn ftp_round_trip() {
         error.message.contains("doesn't offer FTP over TLS"),
         "{error}"
     );
-    common::round_trip(Params::Ftp(params), &dir, false);
+    common::round_trip(Params::Ftp(params), &dir, common::BASIC);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -94,6 +94,58 @@ fn ftps_with_a_self_signed_certificate() {
     let connection = rustzilla_remote::connect(&Params::Ftp(params.clone())).unwrap();
     assert_eq!(connection.security(), Security::Tls);
     drop(connection);
-    common::round_trip(Params::Ftp(params), &dir, false);
+    common::round_trip(Params::Ftp(params), &dir, common::BASIC);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn webdav_round_trip() {
+    use rustzilla_remote::testserver::WebDavTestServer;
+    let dir = std::env::temp_dir().join(format!("rustzilla-dav-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("served/upload")).unwrap();
+    let server = WebDavTestServer::start(&dir.join("served"));
+    let mut wrong = server.params();
+    wrong.password = "nope".into();
+    let error = rustzilla_remote::connect(&Params::WebDav(wrong))
+        .err()
+        .unwrap();
+    assert!(error.message.contains("didn't accept"), "{error}");
+    let connection = rustzilla_remote::connect(&Params::WebDav(server.params())).unwrap();
+    assert!(connection.name().starts_with("dav://127.0.0.1:"));
+    assert_eq!(connection.security(), Security::Plain);
+    common::round_trip(Params::WebDav(server.params()), &dir, common::BASIC);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn s3_round_trip() {
+    use rustzilla_remote::testserver::S3TestServer;
+    let dir = std::env::temp_dir().join(format!("rustzilla-s3-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("served/upload")).unwrap();
+    let server = S3TestServer::start(&dir.join("served"));
+    let mut wrong = server.params();
+    wrong.secret_key = "nope".into();
+    let error = rustzilla_remote::connect(&Params::S3(wrong)).err().unwrap();
+    assert!(error.message.contains("didn't accept the keys"), "{error}");
+    // The root lists the buckets.
+    let connection = rustzilla_remote::connect(&Params::S3(server.params())).unwrap();
+    let mut session = connection.open().unwrap();
+    let buckets: Vec<_> = session
+        .list("/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(buckets, ["upload"]);
+    common::round_trip(
+        Params::S3(server.params()),
+        &dir,
+        common::Caps {
+            chmod: false,
+            empty_dirs: false,
+        },
+    );
     let _ = fs::remove_dir_all(&dir);
 }

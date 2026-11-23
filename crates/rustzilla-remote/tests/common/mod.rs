@@ -21,10 +21,30 @@ pub fn trusting_connect(params: &Params) -> std::sync::Arc<dyn Server> {
     }
 }
 
+/// What a server can do beyond the basics.
+#[derive(Clone, Copy)]
+pub struct Caps {
+    /// Changes permissions and keeps file times (SFTP).
+    pub chmod: bool,
+    /// Lists empty folders (S3 test servers without folder markers don't).
+    pub empty_dirs: bool,
+}
+
+#[allow(dead_code)]
+pub const ALL: Caps = Caps {
+    chmod: true,
+    empty_dirs: true,
+};
+#[allow(dead_code)]
+pub const BASIC: Caps = Caps {
+    chmod: false,
+    empty_dirs: true,
+};
+
 /// Logs in with `params`, then works in `upload` of the home directory;
-/// `dir` is a local directory of the test's own. `chmod`: whether the
-/// server changes permissions and keeps file times (SFTP).
-pub fn round_trip(params: Params, dir: &Path, chmod: bool) {
+/// `dir` is a local directory of the test's own.
+pub fn round_trip(params: Params, dir: &Path, caps: Caps) {
+    let chmod = caps.chmod;
     let connection = trusting_connect(&params);
     let mut sftp = connection.open().unwrap();
     let home = sftp.canonicalize(".").unwrap();
@@ -87,7 +107,7 @@ pub fn round_trip(params: Params, dir: &Path, chmod: bool) {
     let listing = sftp.list(&path::join(&base, "a")).unwrap();
     let names: Vec<_> = listing.iter().map(|e| e.name.as_str()).collect();
     assert!(
-        names.contains(&"b") && names.contains(&"renamed.bin"),
+        (names.contains(&"b") || !caps.empty_dirs) && names.contains(&"renamed.bin"),
         "{names:?}"
     );
     let file = listing.iter().find(|e| e.name == "renamed.bin").unwrap();
@@ -104,7 +124,8 @@ pub fn round_trip(params: Params, dir: &Path, chmod: bool) {
         .map(|(p, _)| p)
         .collect();
     assert!(
-        walked.contains(&"a/b".to_owned()) && walked.contains(&"a/renamed.bin".to_owned()),
+        (walked.contains(&"a/b".to_owned()) || !caps.empty_dirs)
+            && walked.contains(&"a/renamed.bin".to_owned()),
         "{walked:?}"
     );
 

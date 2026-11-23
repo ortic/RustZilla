@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use rustzilla_remote::testserver::{self, FtpTestServer, TestServer};
+use rustzilla_remote::testserver::{self, FtpTestServer, S3TestServer, TestServer};
 
 use super::*;
 
@@ -386,14 +386,16 @@ fn ftps_certificate_then_listing() {
     harness.state_mut().quick_password = "test".into();
     let ctx = harness.ctx.clone();
     // Trusted certificates of this test only.
-    let mut params = harness.state().params(
-        Protocol::Ftp,
-        FtpEncryption::Explicit,
-        "127.0.0.1".into(),
-        server.port,
-        "test".into(),
-        Auth::Password("test".into()),
-    );
+    let mut params = harness.state().params(Login {
+        protocol: Protocol::Ftp,
+        encryption: FtpEncryption::Explicit,
+        host: "127.0.0.1".into(),
+        port: server.port,
+        username: "test".into(),
+        auth: Auth::Password("test".into()),
+        folder: String::new(),
+        region: String::new(),
+    });
     if let Params::Ftp(ftp) = &mut params {
         ftp.trusted_certs = dir.join("certs");
     }
@@ -428,5 +430,58 @@ fn ftps_certificate_then_listing() {
         "# Notes\n"
     );
     save(&mut harness, "ftps");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn s3_buckets_and_upload() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("s3");
+    let (local, served) = (dir.join("local"), dir.join("served"));
+    fill(&local, &served);
+    fs::create_dir_all(served.join("backups")).unwrap();
+    let server = S3TestServer::start(&served);
+    let mut harness = harness(true);
+    harness.state_mut().list_local(&local);
+    let params = harness.state().params(Login {
+        protocol: Protocol::S3,
+        encryption: FtpEncryption::Plain,
+        host: "127.0.0.1".into(),
+        port: server.port,
+        username: "AKTEST".into(),
+        auth: Auth::Password("SECRETTEST".into()),
+        folder: String::new(),
+        region: String::new(),
+    });
+    let ctx = harness.ctx.clone();
+    harness.state_mut().connect(
+        &ctx,
+        Attempt {
+            params,
+            remote_dir: String::new(),
+        },
+    );
+    // The root lists the buckets.
+    wait(&mut harness, "the buckets", |app| {
+        app.state == ConnState::Connected && app.remote.row("backups").is_some()
+    });
+    harness
+        .state_mut()
+        .remote_action(Action::Open("backups".into()));
+    wait(&mut harness, "the bucket", |app| {
+        app.remote.path == "/backups" && !app.remote.busy
+    });
+    harness.state_mut().local_action(Action::Transfer(vec![
+        "report-2026.pdf".into(),
+        "site".into(),
+    ]));
+    wait(&mut harness, "the uploads", |app| {
+        app.remote.row("report-2026.pdf").is_some() && app.remote.row("site").is_some()
+    });
+    assert_eq!(
+        fs::read(served.join("backups/site/index.html")).unwrap(),
+        b"<h1>hi</h1>"
+    );
+    save(&mut harness, "s3");
     let _ = fs::remove_dir_all(&dir);
 }

@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::Error;
 use crate::ftp::FtpParams;
 use crate::path;
+use crate::s3::S3Params;
 use crate::sftp::{EntryKind, Progress, RemoteEntry};
 use crate::ssh::SshParams;
+use crate::webdav::WebDavParams;
 
 /// The protocols RustZilla speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -25,15 +27,27 @@ pub enum Protocol {
     Sftp,
     /// FTP, with or without TLS (see [`FtpEncryption`]).
     Ftp,
+    /// WebDAV over HTTPS (or HTTP).
+    #[serde(rename = "webdav")]
+    WebDav,
+    /// Amazon S3 and compatible object stores.
+    S3,
 }
 
 impl Protocol {
-    pub const ALL: [Protocol; 2] = [Protocol::Sftp, Protocol::Ftp];
+    pub const ALL: [Protocol; 4] = [
+        Protocol::Sftp,
+        Protocol::Ftp,
+        Protocol::WebDav,
+        Protocol::S3,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Protocol::Sftp => "SFTP – SSH File Transfer Protocol",
             Protocol::Ftp => "FTP – File Transfer Protocol",
+            Protocol::WebDav => "WebDAV",
+            Protocol::S3 => "S3 – Amazon S3 and compatible storage",
         }
     }
 
@@ -42,7 +56,23 @@ impl Protocol {
             (Protocol::Sftp, _) => 22,
             (Protocol::Ftp, FtpEncryption::Implicit) => 990,
             (Protocol::Ftp, _) => 21,
+            (Protocol::WebDav | Protocol::S3, FtpEncryption::Plain) => 80,
+            (Protocol::WebDav | Protocol::S3, _) => 443,
         }
+    }
+
+    /// The encryptions to choose from; HTTP protocols have HTTPS or not.
+    pub fn encryptions(self) -> &'static [FtpEncryption] {
+        match self {
+            Protocol::Sftp => &[],
+            Protocol::Ftp => &FtpEncryption::ALL,
+            Protocol::WebDav | Protocol::S3 => &[FtpEncryption::Explicit, FtpEncryption::Plain],
+        }
+    }
+
+    /// Whether `encryption` means TLS for this protocol.
+    pub fn uses_tls(self, encryption: FtpEncryption) -> bool {
+        encryption != FtpEncryption::Plain
     }
 }
 
@@ -69,6 +99,15 @@ impl FtpEncryption {
         FtpEncryption::Plain,
     ];
 
+    /// How the encryption is called for `protocol`.
+    pub fn label_for(self, protocol: Protocol) -> &'static str {
+        match (protocol, self) {
+            (Protocol::WebDav | Protocol::S3, FtpEncryption::Plain) => "HTTP (insecure)",
+            (Protocol::WebDav | Protocol::S3, _) => "HTTPS",
+            _ => self.label(),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             FtpEncryption::ExplicitIfAvailable => "Use explicit FTP over TLS if available",
@@ -84,6 +123,8 @@ impl FtpEncryption {
 pub enum Params {
     Sftp(SshParams),
     Ftp(FtpParams),
+    WebDav(WebDavParams),
+    S3(S3Params),
 }
 
 impl Params {
@@ -91,6 +132,8 @@ impl Params {
         match self {
             Params::Sftp(p) => &p.host,
             Params::Ftp(p) => &p.host,
+            Params::WebDav(p) => &p.host,
+            Params::S3(p) => &p.host,
         }
     }
 
@@ -98,6 +141,8 @@ impl Params {
         match self {
             Params::Sftp(p) => p.port,
             Params::Ftp(p) => p.port,
+            Params::WebDav(p) => p.port,
+            Params::S3(p) => p.port,
         }
     }
 
@@ -105,6 +150,8 @@ impl Params {
         match self {
             Params::Sftp(p) => &p.username,
             Params::Ftp(p) => &p.username,
+            Params::WebDav(p) => &p.username,
+            Params::S3(p) => &p.access_key,
         }
     }
 
@@ -113,6 +160,8 @@ impl Params {
         match self {
             Params::Sftp(_) => Protocol::Sftp,
             Params::Ftp(_) => Protocol::Ftp,
+            Params::WebDav(_) => Protocol::WebDav,
+            Params::S3(_) => Protocol::S3,
         }
     }
 
@@ -121,6 +170,8 @@ impl Params {
         match self {
             Params::Sftp(p) => p.auth = crate::Auth::Password(password),
             Params::Ftp(p) => p.password = password,
+            Params::WebDav(p) => p.password = password,
+            Params::S3(p) => p.secret_key = password,
         }
     }
 }
@@ -130,6 +181,8 @@ pub fn connect(params: &Params) -> Result<Arc<dyn Server>, Error> {
     match params {
         Params::Sftp(p) => Ok(Arc::new(crate::Connection::open(p)?)),
         Params::Ftp(p) => Ok(Arc::new(crate::ftp::FtpServer::open(p)?)),
+        Params::WebDav(p) => Ok(Arc::new(crate::webdav::WebDavServer::open(p)?)),
+        Params::S3(p) => Ok(Arc::new(crate::s3::S3Server::open(p)?)),
     }
 }
 

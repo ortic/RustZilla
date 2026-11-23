@@ -36,6 +36,6 @@ fn openssh_round_trip() {
         eprintln!("RUSTZILLA_TEST_SFTP isn't set: skipped");
         return;
     };
-    common::round_trip(rustzilla_remote::Params::Sftp(params), &dir, true);
+    common::round_trip(rustzilla_remote::Params::Sftp(params), &dir, common::ALL);
     let _ = fs::remove_dir_all(&dir);
 }

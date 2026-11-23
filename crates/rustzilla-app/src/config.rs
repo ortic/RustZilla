@@ -69,7 +69,10 @@ impl Logon {
                 Logon::KeyFile,
                 Logon::Agent,
             ],
-            Protocol::Ftp => &[Logon::Anonymous, Logon::Normal, Logon::AskPassword],
+            Protocol::Ftp | Protocol::WebDav => {
+                &[Logon::Anonymous, Logon::Normal, Logon::AskPassword]
+            }
+            Protocol::S3 => &[Logon::Normal, Logon::AskPassword],
         }
     }
 
@@ -98,8 +101,11 @@ pub struct Site {
     pub user: String,
     pub logon: Logon,
     pub key_file: String,
-    /// Opened after connecting; empty for the home directory.
+    /// Opened after connecting; empty for the home directory. WebDAV's
+    /// folder.
     pub remote_dir: String,
+    /// S3's region, e.g. `eu-central-1`.
+    pub region: String,
     /// Opened on the local side after connecting, if set.
     pub local_dir: String,
 }
@@ -117,6 +123,7 @@ impl Default for Site {
             logon: Logon::Normal,
             key_file: String::new(),
             remote_dir: String::new(),
+            region: String::new(),
             local_dir: String::new(),
         }
     }

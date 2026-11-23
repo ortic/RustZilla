@@ -559,3 +559,129 @@ impl FtpTestServer {
         }
     }
 }
+
+/// A WebDAV server in the process (dav-server), serving a directory to
+/// `test`/`test` (HTTP Basic).
+pub struct WebDavTestServer {
+    pub port: u16,
+    _runtime: Runtime,
+}
+
+impl WebDavTestServer {
+    pub fn start(root: &Path) -> Self {
+        use dav_server::{DavHandler, fakels::FakeLs, localfs::LocalFs};
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        fs::create_dir_all(root).expect("creating the server's directory");
+        let runtime = test_runtime();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("a port");
+        let port = listener.local_addr().expect("its address").port();
+        let handler = DavHandler::builder()
+            .filesystem(LocalFs::new(root, false, false, false))
+            .locksystem(FakeLs::new())
+            .build_handler();
+        runtime.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let handler = handler.clone();
+                        async move {
+                            let authorized = req
+                                .headers()
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                == Some("Basic dGVzdDp0ZXN0");
+                            if !authorized {
+                                let response = hyper::Response::builder()
+                                    .status(401)
+                                    .header("WWW-Authenticate", "Basic realm=\"test\"")
+                                    .body(dav_server::body::Body::from(String::new()))
+                                    .expect("a response");
+                                return Ok::<_, std::convert::Infallible>(response);
+                            }
+                            Ok(handler.handle(req).await)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Self {
+            port,
+            _runtime: runtime,
+        }
+    }
+
+    pub fn params(&self) -> crate::WebDavParams {
+        crate::WebDavParams {
+            host: "127.0.0.1".into(),
+            port: self.port,
+            tls: false,
+            username: "test".into(),
+            password: "test".into(),
+            root: "/".into(),
+        }
+    }
+}
+
+/// An S3 server in the process (s3s-fs): buckets are the directories of
+/// `root`; the keys are `AKTEST`/`SECRETTEST`.
+pub struct S3TestServer {
+    pub port: u16,
+    _runtime: Runtime,
+}
+
+impl S3TestServer {
+    pub fn start(root: &Path) -> Self {
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto::Builder;
+        fs::create_dir_all(root).expect("creating the server's directory");
+        let runtime = test_runtime();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("a port");
+        let port = listener.local_addr().expect("its address").port();
+        let fs = s3s_fs::FileSystem::new(root).expect("the served directory");
+        let mut builder = s3s::service::S3ServiceBuilder::new(fs);
+        builder.set_auth(s3s::auth::SimpleAuth::from_single("AKTEST", "SECRETTEST"));
+        let service = builder.build();
+        runtime.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    let _ = Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Self {
+            port,
+            _runtime: runtime,
+        }
+    }
+
+    pub fn params(&self) -> crate::S3Params {
+        crate::S3Params {
+            host: "127.0.0.1".into(),
+            port: self.port,
+            tls: false,
+            region: "us-east-1".into(),
+            access_key: "AKTEST".into(),
+            secret_key: "SECRETTEST".into(),
+        }
+    }
+}
+
+fn test_runtime() -> Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime")
+}

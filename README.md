@@ -1,9 +1,13 @@
 # RustZilla
 
-A fast, native SFTP client in the spirit of FileZilla, written in Rust on the
-same stack as [DbCraft](https://github.com/ortic/dbcraft): eframe/egui 0.36
-for the UI, russh (pure Rust, on ring) for SSH, and DbCraft's own FIDO code
-for security keys.
+A fast, native file transfer client in the spirit of FileZilla, written in
+Rust on the same stack as [DbCraft](https://github.com/ortic/dbcraft):
+eframe/egui 0.36 for the UI, russh (pure Rust, on ring) for SSH, rustls for
+TLS, and DbCraft's own FIDO code for security keys such as YubiKeys.
+
+Protocols: **SFTP**, **FTP**, **FTPS** (explicit and implicit TLS),
+**WebDAV** (HTTP and HTTPS) and **Amazon S3** and compatible object stores
+(MinIO, Cloudflare R2, Wasabi, Backblaze B2, DigitalOcean Spaces…).
 
 ![RustZilla, connected, with the transfer queue](docs/main.png)
 
@@ -11,6 +15,19 @@ for security keys.
 
 - **SFTP** over SSH: browse, upload, download, create directories, rename,
   delete (recursively), change permissions.
+- **FTP and FTPS**: TLS if the server offers it (as FileZilla's default),
+  required explicit or implicit TLS, or plain FTP with a warning. MLSD/MLST
+  or LIST, resume (REST/APPE), file times (MDTM/MFMT), SITE CHMOD, passive
+  mode that works behind NAT, a reconnect when the server dropped an idle
+  connection. Certificates that don't verify (self-signed, unknown issuer,
+  expired) are shown with subject, issuer, validity and SHA-256 fingerprint
+  to trust, as SSH host keys.
+- **WebDAV** (Nextcloud, ownCloud, Apache, IIS, NAS boxes): PROPFIND
+  listings, resumed downloads (ranges), uploads that keep file times on
+  Nextcloud/ownCloud, MKCOL, MOVE, DELETE.
+- **S3**: buckets at the root, folders as prefixes, Signature V4 signing,
+  resumed downloads, uploads up to 5 GiB, copy-and-delete renames, the
+  bucket's region found by itself.
 - **FileZilla's layout**: Quickconnect bar, message log, local and remote
   panes side by side, transfer queue with queued, failed and successful
   transfers, status bar.
@@ -57,8 +74,12 @@ access, which the udev rules of `libfido2` (package `libfido2-1` or
 
 ## Using it
 
-- **Quickconnect**: `host`, `host:port` or `sftp://user@host:port/path`.
-  Without a password the SSH agent's keys are used.
+- **Quickconnect**: `sftp://`, `ftp://` (TLS if available), `ftpes://`
+  (explicit TLS), `ftps://` (implicit TLS), `davs://` / `dav://` (WebDAV, the
+  path is the WebDAV folder), `s3://endpoint` (access key as the user, secret
+  key as the password), each as `scheme://user@host:port/path`. Without a
+  scheme, port 21 is FTP, 990 FTPS, anything else SFTP. For SFTP without a
+  password the SSH agent's keys are used.
 - **Site Manager** (File → Site Manager): for key files and security keys
   choose the logon type *Key file / security key* and pick the key file
   (e.g. `~/.ssh/id_ed25519_sk`). The passphrase field is for encrypted key
@@ -76,9 +97,10 @@ Linux), trusted host keys and logs in the data directory
 cargo test --workspace
 ```
 
-runs everything, including the SFTP round trip and the transfer queue
-against an SFTP server in the process (`rustzilla-remote`'s `test-server`
-feature), the login with a security key emulated in software, and the UI
+runs everything, including a round trip of every protocol against servers
+in the process (`rustzilla-remote`'s `test-server` feature: russh-sftp,
+libunftp with a self-signed certificate for FTPS, dav-server, s3s-fs), the
+transfer queue, the login with a security key emulated in software, and the UI
 scenes headless. With `RUSTZILLA_SCREENSHOTS=<dir>` the UI scenes are
 rendered as PNGs there (the ones in `docs/` are made that way).
 
@@ -91,10 +113,11 @@ RUSTZILLA_TEST_SFTP=1 cargo test -p rustzilla-remote --test openssh
 
 ## Layout
 
-- `crates/rustzilla-remote`: SSH login (`ssh.rs`, from DbCraft's tunnels),
-  security keys (`fido/`, `ssh/security_key.rs`, from DbCraft), SFTP
-  operations and transfers (`sftp.rs`), blocking API on a tokio runtime per
-  connection.
+- `crates/rustzilla-remote`: the protocols behind one blocking interface
+  (`remote.rs`: a `Server` opens `Session`s): SSH login (`ssh.rs`, from
+  DbCraft's tunnels), security keys (`fido/`, `ssh/security_key.rs`, from
+  DbCraft), SFTP (`sftp.rs`), FTP/FTPS (`ftp.rs`, `tls.rs`), WebDAV
+  (`webdav.rs`), S3 (`s3.rs`) over ureq (`http.rs`).
 - `crates/rustzilla-app`: the egui app: panes (`pane.rs`), the session
   worker (`session.rs`), the transfer queue (`transfers.rs`), the Site
   Manager, dialogs.
