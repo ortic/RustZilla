@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use rustzilla_remote::{FtpEncryption, Protocol};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,11 @@ impl Paths {
     /// Host keys trusted in RustZilla (`~/.ssh/known_hosts` is read too).
     pub fn known_hosts(&self) -> PathBuf {
         self.data_dir.join("known_hosts")
+    }
+
+    /// TLS certificates trusted in RustZilla (FTPS).
+    pub fn trusted_certs(&self) -> PathBuf {
+        self.data_dir.join("trusted_certificates")
     }
 
     pub fn log_dir(&self) -> PathBuf {
@@ -49,15 +55,23 @@ pub enum Logon {
     KeyFile,
     /// The keys of the SSH agent.
     Agent,
+    /// Anonymous FTP.
+    Anonymous,
 }
 
 impl Logon {
-    pub const ALL: [Logon; 4] = [
-        Logon::Normal,
-        Logon::AskPassword,
-        Logon::KeyFile,
-        Logon::Agent,
-    ];
+    /// The logon types of `protocol`.
+    pub fn of(protocol: Protocol) -> &'static [Logon] {
+        match protocol {
+            Protocol::Sftp => &[
+                Logon::Normal,
+                Logon::AskPassword,
+                Logon::KeyFile,
+                Logon::Agent,
+            ],
+            Protocol::Ftp => &[Logon::Anonymous, Logon::Normal, Logon::AskPassword],
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -65,6 +79,7 @@ impl Logon {
             Logon::AskPassword => "Ask for password",
             Logon::KeyFile => "Key file / security key",
             Logon::Agent => "SSH agent",
+            Logon::Anonymous => "Anonymous",
         }
     }
 }
@@ -75,6 +90,9 @@ pub struct Site {
     /// Stable across renames: the keychain entry's name.
     pub id: String,
     pub name: String,
+    pub protocol: Protocol,
+    /// How FTP is encrypted (FTP only).
+    pub encryption: FtpEncryption,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -91,6 +109,8 @@ impl Default for Site {
         Self {
             id: new_id(),
             name: "New site".into(),
+            protocol: Protocol::Sftp,
+            encryption: FtpEncryption::ExplicitIfAvailable,
             host: String::new(),
             port: 22,
             user: String::new(),

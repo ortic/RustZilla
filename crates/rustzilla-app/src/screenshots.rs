@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use rustzilla_sftp::testserver::{self, TestServer};
+use rustzilla_remote::testserver::{self, FtpTestServer, TestServer};
 
 use super::*;
 
@@ -92,7 +92,7 @@ fn connect(harness: &mut Harness<'_, App>, server: &TestServer) {
     harness.state_mut().connect(
         &ctx,
         Attempt {
-            params: server.params(),
+            params: Params::Sftp(server.params()),
             remote_dir: String::new(),
         },
     );
@@ -260,7 +260,7 @@ fn unknown_host_key_then_trusted() {
     harness.state_mut().connect(
         &ctx,
         Attempt {
-            params,
+            params: Params::Sftp(params),
             remote_dir: String::new(),
         },
     );
@@ -286,7 +286,7 @@ fn security_key_prompts() {
     let dir = scratch("sk");
     let key_file = dir.join("id_ecdsa_sk");
     testserver::write_security_key_file(&key_file);
-    assert!(rustzilla_sftp::is_security_key(&key_file));
+    assert!(rustzilla_remote::is_security_key(&key_file));
     let mut harness = harness(false);
     harness.state_mut().list_local(&dir);
     save(&mut harness, "not-connected");
@@ -326,7 +326,7 @@ fn security_key_prompts() {
 
     // The key wants its PIN: asked, then used for the next attempt.
     let attempt = Attempt {
-        params: SshParams {
+        params: Params::Sftp(SshParams {
             host: "web01.example.com".into(),
             port: 22,
             username: "deploy".into(),
@@ -337,7 +337,7 @@ fn security_key_prompts() {
             pin: None,
             known_hosts: dir.join("known_hosts"),
             on_touch: None,
-        },
+        }),
         remote_dir: String::new(),
     };
     harness.state_mut().dialog = Some(Dialog::Secret {
@@ -370,4 +370,63 @@ fn hovering_another_menu_switches_to_it() {
     harness.get_by_label("View").hover();
     harness.run_steps(3);
     assert!(harness.query_by_label("Message log").is_none());
+}
+
+#[test]
+fn ftps_certificate_then_listing() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("ftps");
+    let (local, served) = (dir.join("local"), dir.join("served"));
+    fill(&local, &served);
+    let server = FtpTestServer::start(&served, true);
+    let mut harness = harness(false);
+    harness.state_mut().list_local(&local);
+    harness.state_mut().settings.quick_host = format!("ftpes://127.0.0.1:{}", server.port);
+    harness.state_mut().settings.quick_user = "test".into();
+    harness.state_mut().quick_password = "test".into();
+    let ctx = harness.ctx.clone();
+    // Trusted certificates of this test only.
+    let mut params = harness.state().params(
+        Protocol::Ftp,
+        FtpEncryption::Explicit,
+        "127.0.0.1".into(),
+        server.port,
+        "test".into(),
+        Auth::Password("test".into()),
+    );
+    if let Params::Ftp(ftp) = &mut params {
+        ftp.trusted_certs = dir.join("certs");
+    }
+    harness.state_mut().connect(
+        &ctx,
+        Attempt {
+            params,
+            remote_dir: String::new(),
+        },
+    );
+    wait(&mut harness, "the certificate question", |app| {
+        matches!(app.dialog, Some(Dialog::Certificate(..)))
+    });
+    save(&mut harness, "certificate");
+    harness.get_by_label("Trust and connect").click();
+    wait(&mut harness, "the listing", |app| {
+        app.state == ConnState::Connected && app.remote.row("public_html").is_some()
+    });
+    assert_eq!(
+        harness.state().connection.as_ref().unwrap().security(),
+        Security::Tls
+    );
+    // Upload over FTPS and see it arrive.
+    harness
+        .state_mut()
+        .local_action(Action::Transfer(vec!["notes.md".into()]));
+    wait(&mut harness, "the upload", |app| {
+        app.remote.row("notes.md").is_some()
+    });
+    assert_eq!(
+        fs::read_to_string(served.join("notes.md")).unwrap(),
+        "# Notes\n"
+    );
+    save(&mut harness, "ftps");
+    let _ = fs::remove_dir_all(&dir);
 }

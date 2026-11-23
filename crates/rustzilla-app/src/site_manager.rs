@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use egui::{RichText, Ui};
 
+use rustzilla_remote::{FtpEncryption, Protocol};
+
 use crate::config::{Logon, Site};
 use crate::icons::{self, Icon};
 use crate::secrets;
@@ -77,7 +79,7 @@ impl SiteManager {
             };
             let keep = match site.logon {
                 Logon::Normal | Logon::KeyFile => secret.as_str(),
-                Logon::AskPassword | Logon::Agent => "",
+                Logon::AskPassword | Logon::Agent | Logon::Anonymous => "",
             };
             if let Err(e) = secrets::store(&site.id, keep) {
                 problem = Some(e);
@@ -263,8 +265,53 @@ impl SiteManager {
                 ui.end_row();
 
                 ui.label("Protocol:");
-                ui.label("SFTP – SSH File Transfer Protocol");
+                let before = (site.protocol, site.encryption);
+                egui::ComboBox::from_id_salt("protocol")
+                    .selected_text(site.protocol.label())
+                    .width(300.0)
+                    .show_ui(ui, |ui| {
+                        for protocol in Protocol::ALL {
+                            ui.selectable_value(&mut site.protocol, protocol, protocol.label());
+                        }
+                    });
                 ui.end_row();
+                if site.protocol == Protocol::Ftp {
+                    ui.label("Encryption:");
+                    egui::ComboBox::from_id_salt("encryption")
+                        .selected_text(site.encryption.label())
+                        .width(300.0)
+                        .show_ui(ui, |ui| {
+                            for encryption in FtpEncryption::ALL {
+                                ui.selectable_value(
+                                    &mut site.encryption,
+                                    encryption,
+                                    encryption.label(),
+                                );
+                            }
+                        });
+                    ui.end_row();
+                    if site.encryption == FtpEncryption::Plain {
+                        ui.label("");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(Icon::Warning.sized(ui, 14.0));
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                "The password and the files travel unencrypted.",
+                            );
+                        });
+                        ui.end_row();
+                    }
+                }
+                // The default port follows the protocol, unless one was set.
+                if before != (site.protocol, site.encryption) {
+                    let old_default = before.0.default_port(before.1);
+                    if site.port == old_default || site.port == 0 {
+                        site.port = site.protocol.default_port(site.encryption);
+                    }
+                    if !Logon::of(site.protocol).contains(&site.logon) {
+                        site.logon = Logon::Normal;
+                    }
+                }
 
                 ui.label("Host:");
                 ui.horizontal(|ui| {
@@ -283,15 +330,17 @@ impl SiteManager {
                     .selected_text(site.logon.label())
                     .width(220.0)
                     .show_ui(ui, |ui| {
-                        for logon in Logon::ALL {
+                        for &logon in Logon::of(site.protocol) {
                             ui.selectable_value(&mut site.logon, logon, logon.label());
                         }
                     });
                 ui.end_row();
 
-                ui.label("User:");
-                ui.add(egui::TextEdit::singleline(&mut site.user).desired_width(220.0));
-                ui.end_row();
+                if site.logon != Logon::Anonymous {
+                    ui.label("User:");
+                    ui.add(egui::TextEdit::singleline(&mut site.user).desired_width(220.0));
+                    ui.end_row();
+                }
 
                 match site.logon {
                     Logon::Normal => {
@@ -376,7 +425,7 @@ impl SiteManager {
                         );
                         ui.end_row();
                     }
-                    Logon::AskPassword => {}
+                    Logon::AskPassword | Logon::Anonymous => {}
                 }
 
                 ui.label("Remote directory:");
@@ -411,9 +460,9 @@ impl SiteManager {
 fn key_kind(path: &Path) -> KeyKind {
     if !path.is_file() {
         KeyKind::Unreadable
-    } else if rustzilla_sftp::is_security_key(path) {
+    } else if rustzilla_remote::is_security_key(path) {
         KeyKind::SecurityKey
-    } else if rustzilla_sftp::is_encrypted_key(path) {
+    } else if rustzilla_remote::is_encrypted_key(path) {
         KeyKind::Encrypted
     } else {
         KeyKind::Plain

@@ -5,7 +5,12 @@ use std::path::{Path, PathBuf};
 
 use egui::{Color32, RichText, Ui};
 use egui_extras::{Column, TableBuilder};
-use rustzilla_sftp::{Auth, Connection, ErrorKind, HostKey, RemoteEntry, SshParams, path};
+use std::sync::Arc;
+
+use rustzilla_remote::{
+    Auth, Certificate, ErrorKind, FtpEncryption, FtpParams, HostKey, Params, Protocol, RemoteEntry,
+    Security, Server, SshParams, path,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, Logon, Paths, Site};
@@ -80,7 +85,7 @@ struct LogLine {
 /// key, a PIN, a passphrase).
 #[derive(Clone)]
 struct Attempt {
-    params: SshParams,
+    params: Params,
     remote_dir: String,
 }
 
@@ -100,6 +105,7 @@ enum SecretKind {
 
 enum Dialog {
     HostKey(Box<HostKey>, Box<Attempt>),
+    Certificate(Box<Certificate>, Box<Attempt>),
     Secret {
         kind: SecretKind,
         message: String,
@@ -145,7 +151,7 @@ pub struct App {
     local: Pane,
     remote: Pane,
     session: Option<Session>,
-    connection: Option<Connection>,
+    connection: Option<Arc<dyn Server>>,
     state: ConnState,
     attempt: Option<Attempt>,
     transfers: Transfers,
@@ -237,8 +243,49 @@ impl App {
             .unwrap_or_else(|| std::env::temp_dir().join("rustzilla_known_hosts"))
     }
 
+    fn trusted_certs(&self) -> PathBuf {
+        self.paths
+            .as_ref()
+            .map(Paths::trusted_certs)
+            .unwrap_or_else(|| std::env::temp_dir().join("rustzilla_trusted_certificates"))
+    }
+
     fn server(&self) -> Option<String> {
-        self.connection.as_ref().map(|c| c.server().to_owned())
+        self.connection.as_ref().map(|c| c.name().to_owned())
+    }
+
+    /// The parameters of a login, by protocol.
+    fn params(
+        &self,
+        protocol: Protocol,
+        encryption: FtpEncryption,
+        host: String,
+        port: u16,
+        username: String,
+        auth: Auth,
+    ) -> Params {
+        match protocol {
+            Protocol::Sftp => Params::Sftp(SshParams {
+                host,
+                port,
+                username,
+                auth,
+                pin: None,
+                known_hosts: self.known_hosts(),
+                on_touch: None,
+            }),
+            Protocol::Ftp => Params::Ftp(FtpParams {
+                host,
+                port,
+                username,
+                password: match auth {
+                    Auth::Password(p) => p,
+                    _ => String::new(),
+                },
+                encryption,
+                trusted_certs: self.trusted_certs(),
+            }),
+        }
     }
 
     // Connecting.
@@ -253,29 +300,22 @@ impl App {
             .user
             .clone()
             .unwrap_or_else(|| self.settings.quick_user.trim().to_owned());
-        let port = self
-            .settings
-            .quick_port
-            .trim()
-            .parse()
-            .ok()
-            .or(target.port)
-            .unwrap_or(22);
-        // Without a password, the SSH agent's keys, as FileZilla does.
-        let auth = if self.quick_password.is_empty() {
-            Auth::Agent
-        } else {
-            Auth::Password(self.quick_password.clone())
+        let typed_port: Option<u16> = self.settings.quick_port.trim().parse().ok();
+        let port = typed_port.or(target.port);
+        // The scheme says the protocol; without one the port does, as
+        // FileZilla: 21 FTP, 990 FTPS, anything else SFTP.
+        let (protocol, encryption) = target.scheme.unwrap_or(match port {
+            Some(21) => (Protocol::Ftp, FtpEncryption::ExplicitIfAvailable),
+            Some(990) => (Protocol::Ftp, FtpEncryption::Implicit),
+            _ => (Protocol::Sftp, FtpEncryption::ExplicitIfAvailable),
+        });
+        let port = port.unwrap_or(protocol.default_port(encryption));
+        // Without a password: SFTP the SSH agent's keys, as FileZilla does.
+        let auth = match (protocol, self.quick_password.is_empty()) {
+            (Protocol::Sftp, true) => Auth::Agent,
+            _ => Auth::Password(self.quick_password.clone()),
         };
-        let params = SshParams {
-            host: target.host,
-            port,
-            username: user,
-            auth,
-            pin: None,
-            known_hosts: self.known_hosts(),
-            on_touch: None,
-        };
+        let params = self.params(protocol, encryption, target.host, port, user, auth);
         self.connect(
             ctx,
             Attempt {
@@ -293,23 +333,27 @@ impl App {
         let secret = secret.or_else(|| crate::secrets::load(&site.id));
         let auth = match site.logon {
             Logon::Normal => Auth::Password(secret.unwrap_or_default()),
-            Logon::AskPassword => Auth::Password(String::new()),
+            Logon::AskPassword | Logon::Anonymous => Auth::Password(String::new()),
             Logon::KeyFile => Auth::KeyFile {
                 path: site_manager::expand_home(&site.key_file),
                 passphrase: secret.unwrap_or_default(),
             },
             Logon::Agent => Auth::Agent,
         };
+        let user = if site.logon == Logon::Anonymous {
+            String::new()
+        } else {
+            site.user.trim().to_owned()
+        };
         let attempt = Attempt {
-            params: SshParams {
-                host: site.host.trim().to_owned(),
-                port: site.port,
-                username: site.user.trim().to_owned(),
+            params: self.params(
+                site.protocol,
+                site.encryption,
+                site.host.trim().to_owned(),
+                site.port,
+                user,
                 auth,
-                pin: None,
-                known_hosts: self.known_hosts(),
-                on_touch: None,
-            },
+            ),
             remote_dir: site.remote_dir.clone(),
         };
         if site.logon == Logon::AskPassword {
@@ -326,8 +370,11 @@ impl App {
 
     fn connect(&mut self, ctx: &egui::Context, attempt: Attempt) {
         self.disconnect();
-        if let Auth::KeyFile { path, .. } = &attempt.params.auth
-            && rustzilla_sftp::is_security_key(path)
+        if let Params::Sftp(SshParams {
+            auth: Auth::KeyFile { path, .. },
+            ..
+        }) = &attempt.params
+            && rustzilla_remote::is_security_key(path)
         {
             self.log(
                 LogKind::Status,
@@ -373,10 +420,7 @@ impl App {
                 Event::Connected { connection, home } => {
                     self.log(
                         LogKind::Status,
-                        format!(
-                            "Connected to {}, home directory {home}",
-                            connection.server()
-                        ),
+                        format!("Connected to {}, home directory {home}", connection.name()),
                     );
                     self.transfers
                         .start(connection.clone(), self.settings.parallel, ctx.clone());
@@ -384,8 +428,9 @@ impl App {
                     self.state = ConnState::Connected;
                     self.remote_home = home;
                     self.security_key_login = matches!(
-                        self.attempt.as_ref().map(|a| &a.params.auth),
-                        Some(Auth::KeyFile { path, .. }) if rustzilla_sftp::is_security_key(path)
+                        self.attempt.as_ref().map(|a| &a.params),
+                        Some(Params::Sftp(SshParams { auth: Auth::KeyFile { path, .. }, .. }))
+                            if rustzilla_remote::is_security_key(path)
                     );
                 }
                 Event::Failed(error) => {
@@ -397,6 +442,10 @@ impl App {
                         (ErrorKind::UnknownHostKey(key), Some(attempt)) => {
                             self.log(LogKind::Status, error.message.clone());
                             self.dialog = Some(Dialog::HostKey(key, attempt));
+                        }
+                        (ErrorKind::UnknownCertificate(cert), Some(attempt)) => {
+                            self.log(LogKind::Status, error.message.clone());
+                            self.dialog = Some(Dialog::Certificate(cert, attempt));
                         }
                         (ErrorKind::Pin, Some(attempt)) => {
                             self.log(LogKind::Status, error.message.clone());
@@ -456,7 +505,7 @@ impl App {
         }
         // A connection that died while idle.
         if self.state == ConnState::Connected
-            && self.connection.as_ref().is_some_and(Connection::is_closed)
+            && self.connection.as_ref().is_some_and(|c| c.is_closed())
         {
             self.log(
                 LogKind::Error,
@@ -767,7 +816,7 @@ impl App {
         for site in &self.sites {
             let icon = match site.logon {
                 Logon::KeyFile
-                    if rustzilla_sftp::is_security_key(&site_manager::expand_home(
+                    if rustzilla_remote::is_security_key(&site_manager::expand_home(
                         &site.key_file,
                     )) =>
                 {
@@ -1173,13 +1222,23 @@ impl App {
         ui.horizontal(|ui| {
             match (&self.state, &self.connection) {
                 (ConnState::Connected, Some(c)) => {
-                    ui.add(
-                        Icon::Lock
-                            .mono(theme::SUCCESS)
-                            .fit_to_exact_size(egui::vec2(14.0, 14.0)),
-                    );
-                    ui.label(format!("Connected to {}", c.server()));
-                    ui.weak("SFTP");
+                    let (secure, kind) = match c.security() {
+                        Security::Ssh => (true, "SFTP"),
+                        Security::Tls => (true, "FTP over TLS"),
+                        Security::Plain => (false, "FTP, not encrypted"),
+                    };
+                    if secure {
+                        ui.add(
+                            Icon::Lock
+                                .mono(theme::SUCCESS)
+                                .fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                        );
+                    } else {
+                        ui.add(Icon::Warning.sized(ui, 14.0))
+                            .on_hover_text("Passwords and files travel unencrypted");
+                    }
+                    ui.label(format!("Connected to {}", c.name()));
+                    ui.weak(kind);
                     if self.security_key_login {
                         ui.separator();
                         ui.add(Icon::SecurityKey.sized(ui, 14.0));
@@ -1320,13 +1379,86 @@ impl App {
                         }
                     });
                 }
+                Dialog::Certificate(cert, attempt) => {
+                    let host = format!("{}:{}", cert.host, cert.port);
+                    header(
+                        ui,
+                        Icon::Shield,
+                        "Unknown certificate",
+                        &format!(
+                            "The TLS certificate of {host} isn't trusted: {}.",
+                            cert.problem
+                        ),
+                    );
+                    theme::card(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::Grid::new("certificate")
+                            .num_columns(2)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                for (label, value) in [
+                                    ("Subject", &cert.subject),
+                                    ("Issuer", &cert.issuer),
+                                    ("Valid from", &cert.valid_from),
+                                    ("Valid until", &cert.valid_until),
+                                ] {
+                                    ui.weak(label);
+                                    ui.add(egui::Label::new(value.as_str()).wrap());
+                                    ui.end_row();
+                                }
+                                ui.weak("SHA-256");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&cert.fingerprint).monospace().small(),
+                                        )
+                                        .wrap(),
+                                    );
+                                    if icons::icon_button(ui, Icon::Copy, "Copy the fingerprint")
+                                        .clicked()
+                                    {
+                                        ui.ctx().copy_text(cert.fingerprint.clone());
+                                    }
+                                });
+                                ui.end_row();
+                            });
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(Icon::Warning.sized(ui, 14.0));
+                        ui.label(
+                            "Trust it only if you know the server uses this certificate, e.g. \
+                             because its administrator gave you the fingerprint.",
+                        );
+                    });
+                    buttons(ui, |ui| {
+                        if ui.add(theme::primary_button("Trust and connect")).clicked() {
+                            let (cert, attempt) = (cert.clone(), attempt.clone());
+                            then = Some(Box::new(move |app: &mut Self| match cert.trust() {
+                                Ok(()) => {
+                                    app.log(
+                                        LogKind::Status,
+                                        format!("Trusted the certificate of {}", cert.host),
+                                    );
+                                    let ctx = app.ctx.clone();
+                                    app.connect(&ctx, *attempt);
+                                }
+                                Err(e) => app.dialog = Some(Dialog::Message(e.message)),
+                            }));
+                            keep = false;
+                        }
+                        if ui.add(theme::secondary_button("Cancel")).clicked() {
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::Secret {
                     kind,
                     message,
                     value,
                     attempt,
                 } => {
-                    let server = attempt.params.host.clone();
+                    let server = attempt.params.host().to_owned();
                     match kind {
                         SecretKind::Pin => {
                             header(
@@ -1337,7 +1469,7 @@ impl App {
                                  touch the key when it blinks.",
                             );
                             // Asked again: a wrong PIN, and the tries left.
-                            if message.contains(rustzilla_sftp::fido::PIN_WRONG) {
+                            if message.contains(rustzilla_remote::fido::PIN_WRONG) {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.add(Icon::Error.sized(ui, 14.0));
                                     let text = message
@@ -1357,7 +1489,7 @@ impl App {
                             ui,
                             Icon::Lock,
                             "Password",
-                            &format!("Log in as {} on {server}.", attempt.params.username),
+                            &format!("Log in as {} on {server}.", attempt.params.username()),
                         ),
                     }
                     ui.add_space(6.0);
@@ -1384,17 +1516,21 @@ impl App {
                             let mut attempt = (**attempt).clone();
                             let value = std::mem::take(value);
                             match kind {
-                                SecretKind::Pin => attempt.params.pin = Some(value),
+                                SecretKind::Pin => {
+                                    if let Params::Sftp(ssh) = &mut attempt.params {
+                                        ssh.pin = Some(value);
+                                    }
+                                }
                                 SecretKind::Passphrase => {
-                                    if let Auth::KeyFile { passphrase, .. } =
-                                        &mut attempt.params.auth
+                                    if let Params::Sftp(SshParams {
+                                        auth: Auth::KeyFile { passphrase, .. },
+                                        ..
+                                    }) = &mut attempt.params
                                     {
                                         *passphrase = value;
                                     }
                                 }
-                                SecretKind::Password => {
-                                    attempt.params.auth = Auth::Password(value)
-                                }
+                                SecretKind::Password => attempt.params.set_password(value),
                             }
                             then = Some(Box::new(move |app: &mut Self| {
                                 let ctx = app.ctx.clone();
@@ -1613,6 +1749,7 @@ impl App {
                                 for (label, path) in [
                                     ("Sites", paths.config_dir.clone()),
                                     ("Known hosts", paths.known_hosts()),
+                                    ("Certificates", paths.trusted_certs()),
                                     ("Logs", paths.log_dir()),
                                 ] {
                                     ui.weak(label);
@@ -2216,6 +2353,9 @@ fn buttons(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 /// `sftp://user@host:port/path`.
 #[derive(Debug, PartialEq, Eq)]
 struct Target {
+    /// From the scheme: `sftp://`, `ftp://`, `ftps://` (implicit TLS),
+    /// `ftpes://` (explicit TLS).
+    scheme: Option<(Protocol, FtpEncryption)>,
     host: String,
     port: Option<u16>,
     user: Option<String>,
@@ -2224,8 +2364,21 @@ struct Target {
 
 fn parse_host(input: &str) -> Option<Target> {
     let mut rest = input.trim();
-    if let Some(stripped) = rest.strip_prefix("sftp://") {
-        rest = stripped;
+    let mut scheme = None;
+    for (prefix, protocol, encryption) in [
+        (
+            "sftp://",
+            Protocol::Sftp,
+            FtpEncryption::ExplicitIfAvailable,
+        ),
+        ("ftp://", Protocol::Ftp, FtpEncryption::ExplicitIfAvailable),
+        ("ftps://", Protocol::Ftp, FtpEncryption::Implicit),
+        ("ftpes://", Protocol::Ftp, FtpEncryption::Explicit),
+    ] {
+        if let Some(stripped) = rest.strip_prefix(prefix) {
+            rest = stripped;
+            scheme = Some((protocol, encryption));
+        }
     }
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], Some(rest[i..].to_owned())),
@@ -2248,6 +2401,7 @@ fn parse_host(input: &str) -> Option<Target> {
         return None;
     }
     Some(Target {
+        scheme,
         host: host.to_owned(),
         port,
         user,
@@ -2261,27 +2415,39 @@ mod tests {
 
     #[test]
     fn quickconnect_hosts() {
+        let t = parse_host("example.com").unwrap();
         assert_eq!(
-            parse_host("example.com"),
-            Some(Target {
-                host: "example.com".into(),
-                port: None,
-                user: None,
-                path: None
-            })
+            (t.scheme, t.host.as_str(), t.port, t.user, t.path),
+            (None, "example.com", None, None, None)
         );
+        let t = parse_host("sftp://deploy@example.com:2222/var/www").unwrap();
+        assert_eq!(t.scheme.map(|s| s.0), Some(Protocol::Sftp));
+        assert_eq!((t.host.as_str(), t.port), ("example.com", Some(2222)));
         assert_eq!(
-            parse_host("sftp://deploy@example.com:2222/var/www"),
-            Some(Target {
-                host: "example.com".into(),
-                port: Some(2222),
-                user: Some("deploy".into()),
-                path: Some("/var/www".into())
-            })
+            (t.user.as_deref(), t.path.as_deref()),
+            (Some("deploy"), Some("/var/www"))
         );
+        for (input, protocol, encryption) in [
+            (
+                "ftp://example.com",
+                Protocol::Ftp,
+                FtpEncryption::ExplicitIfAvailable,
+            ),
+            ("ftps://example.com", Protocol::Ftp, FtpEncryption::Implicit),
+            (
+                "ftpes://example.com",
+                Protocol::Ftp,
+                FtpEncryption::Explicit,
+            ),
+        ] {
+            assert_eq!(
+                parse_host(input).unwrap().scheme,
+                Some((protocol, encryption))
+            );
+        }
         let ipv6 = parse_host("[::1]:22").unwrap();
         assert_eq!((ipv6.host.as_str(), ipv6.port), ("::1", Some(22)));
-        assert_eq!(parse_host("  "), None);
+        assert!(parse_host("  ").is_none());
     }
 }
 

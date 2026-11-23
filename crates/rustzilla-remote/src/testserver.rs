@@ -489,3 +489,73 @@ impl russh_sftp::server::Handler for SftpHandler {
         Ok(ok(id))
     }
 }
+
+/// An FTP server in the process (libunftp), serving a directory to any
+/// user and password, with explicit TLS on a self-signed certificate when
+/// asked.
+pub struct FtpTestServer {
+    pub port: u16,
+    pub root: PathBuf,
+    _runtime: Runtime,
+}
+
+impl FtpTestServer {
+    pub fn start(root: &Path, tls: bool) -> Self {
+        fs::create_dir_all(root).expect("creating the server's directory");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free port")
+            .port();
+        let served = root.to_owned();
+        let mut builder = libunftp::ServerBuilder::new(Box::new(move || {
+            unftp_sbe_fs::Filesystem::new(served.clone()).expect("the served directory")
+        }))
+        .greeting("RustZilla test server")
+        .passive_ports(50000..=60000);
+        if tls {
+            let dir = root.with_extension("tls");
+            fs::create_dir_all(&dir).expect("a directory for the certificate");
+            let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()])
+                .expect("a certificate");
+            fs::write(dir.join("cert.pem"), cert.cert.pem()).expect("writing it");
+            fs::write(dir.join("key.pem"), cert.signing_key.serialize_pem()).expect("writing it");
+            builder = builder.ftps(dir.join("cert.pem"), dir.join("key.pem"));
+        }
+        let server = builder.build().expect("the FTP server");
+        runtime.spawn(async move {
+            let _ = server.listen(format!("127.0.0.1:{port}")).await;
+        });
+        // Until it listens.
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Self {
+            port,
+            root: root.to_owned(),
+            _runtime: runtime,
+        }
+    }
+
+    pub fn params(
+        &self,
+        encryption: crate::FtpEncryption,
+        trusted_certs: &Path,
+    ) -> crate::FtpParams {
+        crate::FtpParams {
+            host: "127.0.0.1".into(),
+            port: self.port,
+            username: "test".into(),
+            password: "test".into(),
+            encryption,
+            trusted_certs: trusted_certs.to_owned(),
+        }
+    }
+}

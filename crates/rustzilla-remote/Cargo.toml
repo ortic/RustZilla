@@ -1,5 +1,5 @@
 [package]
-name = "rustzilla-sftp"
+name = "rustzilla-remote"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,23 +7,36 @@ rust-version.workspace = true
 
 [features]
 # An SFTP server in the process (testserver.rs), for the tests of the app.
-test-server = []
+test-server = ["dep:libunftp", "dep:unftp-sbe-fs", "dep:rcgen"]
 
 [dependencies]
+# The FTP(S) server of the tests (test-server feature).
+libunftp = { version = "0.25", default-features = false, features = ["ring"], optional = true }
+unftp-sbe-fs = { version = "0.4", optional = true }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"], optional = true }
+# Certificate fingerprints, and CTAP2's hashes (see below).
+ring.workspace = true
+jiff = { version = "1", default-features = false, features = ["std"] }
 russh.workspace = true
 russh-sftp.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+serde.workspace = true
+# FTP and FTPS, synchronous like the API, on rustls with ring.
+suppaftp = { version = "13", default-features = false, features = ["rustls-ring", "deprecated"] }
 tokio.workspace = true
 tracing.workspace = true
+webpki-roots = "1"
+# The subject, issuer and validity of certificates to trust.
+x509-parser = "0.18"
 
 # Security keys: CTAP2 over USB HID on Linux and macOS. The tests run it
 # against a key in software everywhere.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 aes.workspace = true
-ring.workspace = true
 
 [target.'cfg(not(any(target_os = "linux", target_os = "macos")))'.dev-dependencies]
 aes.workspace = true
-ring.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
@@ -40,4 +53,4 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-rustzilla-sftp = { path = ".", features = ["test-server"] }
+rustzilla-remote = { path = ".", features = ["test-server"] }

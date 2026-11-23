@@ -4,23 +4,29 @@ use std::fs;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use rustzilla_sftp::{Connection, EntryKind, ErrorKind, SshParams, path};
+use rustzilla_remote::{EntryKind, ErrorKind, Params, Server, connect, path};
 
-/// Logs in with `params`, then works in `upload` of the home directory;
-/// `dir` is a local directory of the test's own.
-pub fn round_trip(params: SshParams, dir: &Path) {
-    // Unknown at first; trusted, it connects.
-    let connection = match Connection::open(&params) {
+/// Connects; trusts an unknown host key or certificate first.
+pub fn trusting_connect(params: &Params) -> std::sync::Arc<dyn Server> {
+    match connect(params) {
         Ok(c) => c,
         Err(e) => {
-            let ErrorKind::UnknownHostKey(key) = e.kind else {
-                panic!("{e}")
-            };
-            key.trust().unwrap();
-            Connection::open(&params).unwrap()
+            match e.kind {
+                ErrorKind::UnknownHostKey(key) => key.trust().unwrap(),
+                ErrorKind::UnknownCertificate(cert) => cert.trust().unwrap(),
+                _ => panic!("{e}"),
+            }
+            connect(params).unwrap()
         }
-    };
-    let sftp = connection.sftp().unwrap();
+    }
+}
+
+/// Logs in with `params`, then works in `upload` of the home directory;
+/// `dir` is a local directory of the test's own. `chmod`: whether the
+/// server changes permissions and keeps file times (SFTP).
+pub fn round_trip(params: Params, dir: &Path, chmod: bool) {
+    let connection = trusting_connect(&params);
+    let mut sftp = connection.open().unwrap();
     let home = sftp.canonicalize(".").unwrap();
     let base = path::join(
         &path::join(&home, "upload"),
@@ -62,7 +68,9 @@ pub fn round_trip(params: SshParams, dir: &Path) {
             .unwrap()
             .as_secs()
     };
-    assert_eq!(seconds(&back), seconds(&local));
+    if chmod {
+        assert_eq!(seconds(&back), seconds(&local));
+    }
 
     // A cancelled download stops.
     let error = sftp
@@ -73,7 +81,9 @@ pub fn round_trip(params: SshParams, dir: &Path) {
     // Rename, chmod, list, walk.
     let renamed = path::join(&base, "a/renamed.bin");
     sftp.rename(&remote, &renamed).unwrap();
-    sftp.chmod(&renamed, 0o600).unwrap();
+    if chmod {
+        sftp.chmod(&renamed, 0o600).unwrap();
+    }
     let listing = sftp.list(&path::join(&base, "a")).unwrap();
     let names: Vec<_> = listing.iter().map(|e| e.name.as_str()).collect();
     assert!(
@@ -81,7 +91,12 @@ pub fn round_trip(params: SshParams, dir: &Path) {
         "{names:?}"
     );
     let file = listing.iter().find(|e| e.name == "renamed.bin").unwrap();
-    assert_eq!(file.permissions, Some(0o600));
+    if chmod {
+        assert_eq!(file.permissions, Some(0o600));
+    }
+    // A second session works alongside.
+    let mut other = connection.open().unwrap();
+    assert!(other.stat(&renamed).unwrap().is_some());
     let walked: Vec<_> = sftp
         .walk(&base, &never)
         .unwrap()

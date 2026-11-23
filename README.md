@@ -77,7 +77,7 @@ cargo test --workspace
 ```
 
 runs everything, including the SFTP round trip and the transfer queue
-against an SFTP server in the process (`rustzilla-sftp`'s `test-server`
+against an SFTP server in the process (`rustzilla-remote`'s `test-server`
 feature), the login with a security key emulated in software, and the UI
 scenes headless. With `RUSTZILLA_SCREENSHOTS=<dir>` the UI scenes are
 rendered as PNGs there (the ones in `docs/` are made that way).
@@ -86,12 +86,12 @@ Against a real OpenSSH server:
 
 ```sh
 docker compose up -d
-RUSTZILLA_TEST_SFTP=1 cargo test -p rustzilla-sftp --test openssh
+RUSTZILLA_TEST_SFTP=1 cargo test -p rustzilla-remote --test openssh
 ```
 
 ## Layout
 
-- `crates/rustzilla-sftp`: SSH login (`ssh.rs`, from DbCraft's tunnels),
+- `crates/rustzilla-remote`: SSH login (`ssh.rs`, from DbCraft's tunnels),
   security keys (`fido/`, `ssh/security_key.rs`, from DbCraft), SFTP
   operations and transfers (`sftp.rs`), blocking API on a tokio runtime per
   connection.

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use rustzilla_sftp::{Connection, Error, ErrorKind, RemoteEntry, Sftp, SshParams, path};
+use rustzilla_remote::{Error, ErrorKind, Params, RemoteEntry, Server, Session as Remote, path};
 
 /// What the UI asks of the session.
 pub enum Command {
@@ -39,7 +39,7 @@ pub enum Event {
     /// The security key waits to be touched.
     Touch,
     Connected {
-        connection: Connection,
+        connection: Arc<dyn Server>,
         home: String,
     },
     /// Logging in failed.
@@ -64,7 +64,7 @@ pub struct Session {
 impl Session {
     /// Logs in on a thread of its own, then lists `start_dir` (the home
     /// directory if empty).
-    pub fn start(mut params: SshParams, start_dir: String, ctx: egui::Context) -> Self {
+    pub fn start(mut params: Params, start_dir: String, ctx: egui::Context) -> Self {
         let (tx, commands) = mpsc::channel();
         let (events, rx) = mpsc::channel();
         let emit = {
@@ -85,7 +85,9 @@ impl Session {
                 ctx.request_repaint();
             })
         };
-        params.on_touch = Some(touch);
+        if let Params::Sftp(ssh) = &mut params {
+            ssh.on_touch = Some(touch);
+        }
         thread::Builder::new()
             .name("session".into())
             .spawn(move || run(params, start_dir, commands, emit))
@@ -98,23 +100,27 @@ impl Session {
     }
 }
 
-fn run(params: SshParams, start_dir: String, commands: Receiver<Command>, emit: impl Fn(Event)) {
+fn run(params: Params, start_dir: String, commands: Receiver<Command>, emit: impl Fn(Event)) {
     let log = |kind, text: String| emit(Event::Log(kind, text));
-    let server = if params.port == 22 {
-        params.host.clone()
-    } else {
-        format!("{}:{}", params.host, params.port)
-    };
+    let server = format!("{}:{}", params.host(), params.port());
     log(LogKind::Status, format!("Connecting to {server}..."));
-    let connection = match Connection::open(&params) {
+    let connection = match rustzilla_remote::connect(&params) {
         Ok(connection) => connection,
         Err(e) => return emit(Event::Failed(e)),
     };
     log(
         LogKind::Status,
-        format!("Logged in to {server} as {}", params.username),
+        format!(
+            "Logged in to {} as {}",
+            connection.name(),
+            if params.username().is_empty() {
+                "anonymous"
+            } else {
+                params.username()
+            }
+        ),
     );
-    let sftp = match connection.sftp() {
+    let mut sftp = match connection.open() {
         Ok(sftp) => sftp,
         Err(e) => return emit(Event::Failed(e)),
     };
@@ -140,7 +146,10 @@ fn run(params: SshParams, start_dir: String, commands: Receiver<Command>, emit: 
             Command::List(dir) => worker.list(&dir),
             Command::Mkdir(dir) => {
                 log(LogKind::Command, format!("mkdir {dir}"));
-                worker.change(&path::parent(&dir), worker.sftp.mkdir(&dir))
+                {
+                    let result = worker.sftp.mkdir(&dir);
+                    worker.change(&path::parent(&dir), result)
+                }
             }
             Command::Rename { from, to } => {
                 log(LogKind::Command, format!("rename {from} -> {to}"));
@@ -179,7 +188,8 @@ fn run(params: SshParams, start_dir: String, commands: Receiver<Command>, emit: 
                 let mut alive = true;
                 for target in &paths {
                     log(LogKind::Command, format!("chmod {mode:o} {target}"));
-                    if !worker.check(worker.sftp.chmod(target, mode)) {
+                    let result = worker.sftp.chmod(target, mode);
+                    if !worker.check(result) {
                         alive = false;
                         break;
                     }
@@ -208,7 +218,7 @@ fn run(params: SshParams, start_dir: String, commands: Receiver<Command>, emit: 
 }
 
 struct Worker<'a, E: Fn(Event)> {
-    sftp: Sftp,
+    sftp: Box<dyn Remote>,
     emit: &'a E,
 }
 

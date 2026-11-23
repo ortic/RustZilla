@@ -15,6 +15,9 @@ pub enum ErrorKind {
     /// The server's host key isn't known yet: the user may trust it and
     /// connect again.
     UnknownHostKey(Box<HostKey>),
+    /// The server's TLS certificate isn't trusted (self-signed, unknown
+    /// issuer…): the user may trust it and connect again.
+    UnknownCertificate(Box<crate::tls::Certificate>),
     /// The security key needs its PIN, or refused the one given: the app
     /// asks for it and connects again.
     Pin,

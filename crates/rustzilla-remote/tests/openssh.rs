@@ -1,5 +1,5 @@
 //! Against a real OpenSSH server: `docker compose up -d`, then
-//! `RUSTZILLA_TEST_SFTP=1 cargo test -p rustzilla-sftp --test openssh`.
+//! `RUSTZILLA_TEST_SFTP=1 cargo test -p rustzilla-remote --test openssh`.
 //! `RUSTZILLA_TEST_SFTP=host:port:user:password` points elsewhere; the user
 //! needs to be able to write in `upload` in its home directory.
 
@@ -7,7 +7,7 @@ mod common;
 
 use std::fs;
 
-use rustzilla_sftp::{Auth, SshParams};
+use rustzilla_remote::{Auth, SshParams};
 
 fn params(dir: &std::path::Path) -> Option<SshParams> {
     let setting = std::env::var("RUSTZILLA_TEST_SFTP").ok()?;
@@ -36,6 +36,6 @@ fn openssh_round_trip() {
         eprintln!("RUSTZILLA_TEST_SFTP isn't set: skipped");
         return;
     };
-    common::round_trip(params, &dir);
+    common::round_trip(rustzilla_remote::Params::Sftp(params), &dir, true);
     let _ = fs::remove_dir_all(&dir);
 }

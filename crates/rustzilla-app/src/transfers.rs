@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Instant, SystemTime};
 
-use rustzilla_sftp::{Connection, ErrorKind, Sftp, path};
+use rustzilla_remote::{ErrorKind, Server, Session, path};
 use serde::{Deserialize, Serialize};
 
 use crate::local;
@@ -175,7 +175,7 @@ impl Transfers {
     }
 
     /// Starts `count` workers on `connection`.
-    pub fn start(&mut self, connection: Connection, count: usize, ctx: egui::Context) {
+    pub fn start(&mut self, connection: Arc<dyn Server>, count: usize, ctx: egui::Context) {
         self.stop();
         let generation = self.queue().generation;
         for n in 0..count.max(1) {
@@ -327,8 +327,8 @@ enum Outcome {
     Lost(String),
 }
 
-fn worker(shared: Arc<Shared>, connection: Connection, generation: u64, ctx: egui::Context) {
-    let server = connection.server().to_owned();
+fn worker(shared: Arc<Shared>, connection: Arc<dyn Server>, generation: u64, ctx: egui::Context) {
+    let server = connection.name().to_owned();
     let log = |kind, text: String| {
         shared
             .queue
@@ -338,7 +338,7 @@ fn worker(shared: Arc<Shared>, connection: Connection, generation: u64, ctx: egu
             .push((kind, text));
         ctx.request_repaint();
     };
-    let mut sftp: Option<Sftp> = None;
+    let mut sftp: Option<Box<dyn Session>> = None;
     loop {
         let job = {
             let mut queue = shared.queue.lock().expect("queue mutex");
@@ -363,9 +363,9 @@ fn worker(shared: Arc<Shared>, connection: Connection, generation: u64, ctx: egu
         };
         ctx.request_repaint();
         // The session opens with the first transfer.
-        let session = match &sftp {
+        let session = match &mut sftp {
             Some(session) => session,
-            None => match connection.sftp() {
+            None => match connection.open() {
                 Ok(session) => sftp.insert(session),
                 Err(e) => {
                     log(LogKind::Error, e.message.clone());
@@ -442,8 +442,14 @@ fn finish(shared: &Shared, id: u64, outcome: Outcome) {
     shared.wake.notify_all();
 }
 
-fn run(sftp: &Sftp, shared: &Shared, job: &Item, policy: Exists, ctx: &egui::Context) -> Outcome {
-    let lost_or_failed = |e: rustzilla_sftp::Error| match e.kind {
+fn run(
+    sftp: &mut Box<dyn Session>,
+    shared: &Shared,
+    job: &Item,
+    policy: Exists,
+    ctx: &egui::Context,
+) -> Outcome {
+    let lost_or_failed = |e: rustzilla_remote::Error| match e.kind {
         ErrorKind::Cancelled => Outcome::Cancelled,
         ErrorKind::Disconnected => Outcome::Lost(e.message),
         _ => Outcome::Failed(e.message),
@@ -468,7 +474,7 @@ fn run(sftp: &Sftp, shared: &Shared, job: &Item, policy: Exists, ctx: &egui::Con
                     if let Err(e) = fs::create_dir_all(&local) {
                         return Outcome::Failed(format!("creating {}: {e}", local.display()));
                     }
-                } else if entry.kind == rustzilla_sftp::EntryKind::File {
+                } else if entry.kind == rustzilla_remote::EntryKind::File {
                     children.push(NewItem {
                         direction: Direction::Download,
                         local,
@@ -625,7 +631,7 @@ fn set_size(shared: &Shared, id: u64, size: u64) {
 mod tests {
     use std::time::Duration;
 
-    use rustzilla_sftp::testserver::TestServer;
+    use rustzilla_remote::testserver::TestServer;
 
     use super::*;
 
@@ -661,8 +667,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rustzilla-tq-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let server = TestServer::start(&dir.join("served"), &dir.join("known_hosts"));
-        let connection = Connection::open(&server.params()).unwrap();
-        let name = connection.server().to_owned();
+        let connection =
+            rustzilla_remote::connect(&rustzilla_remote::Params::Sftp(server.params())).unwrap();
+        let name = connection.name().to_owned();
 
         // A tree to upload.
         let source = dir.join("source");

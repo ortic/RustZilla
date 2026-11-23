@@ -175,23 +175,6 @@ impl Sftp {
             .map_err(|e| self.error("creating the directory", path, e))
     }
 
-    /// Creates `path` and the directories above it that are missing.
-    pub fn mkdir_all(&self, path: &str) -> Result<(), Error> {
-        if path.is_empty() || path == "/" || path == "." {
-            return Ok(());
-        }
-        match self.stat(path)? {
-            Some(e) if e.is_dir() => Ok(()),
-            Some(_) => Err(Error::new(format!(
-                "creating the directory {path}: a file is in the way"
-            ))),
-            None => {
-                self.mkdir_all(&path::parent(path))?;
-                self.mkdir(path)
-            }
-        }
-    }
-
     pub fn remove_file(&self, path: &str) -> Result<(), Error> {
         self.connection
             .block_on(self.session.remove_file(path))
@@ -202,23 +185,6 @@ impl Sftp {
         self.connection
             .block_on(self.session.remove_dir(path))
             .map_err(|e| self.error("deleting the directory", path, e))
-    }
-
-    /// Deletes the directory `path` with everything in it. Links are
-    /// deleted, not followed.
-    pub fn remove_all(&self, path: &str, cancel: &dyn Fn() -> bool) -> Result<(), Error> {
-        for entry in self.list(path)? {
-            if cancel() {
-                return Err(Error::cancelled());
-            }
-            let child = path::join(path, &entry.name);
-            if entry.is_dir() && !entry.symlink {
-                self.remove_all(&child, cancel)?;
-            } else {
-                self.remove_file(&child)?;
-            }
-        }
-        self.remove_dir(path)
     }
 
     pub fn rename(&self, from: &str, to: &str) -> Result<(), Error> {
@@ -236,36 +202,6 @@ impl Sftp {
         self.connection
             .block_on(self.session.set_metadata(path, attrs))
             .map_err(|e| self.error("changing the permissions of", path, e))
-    }
-
-    /// The files and directories under `dir`, as paths relative to it,
-    /// directories before what they hold. Links to directories aren't
-    /// followed (they could lead in a circle).
-    pub fn walk(
-        &self,
-        dir: &str,
-        cancel: &dyn Fn() -> bool,
-    ) -> Result<Vec<(String, RemoteEntry)>, Error> {
-        let mut out = Vec::new();
-        let mut pending = vec![String::new()];
-        while let Some(relative) = pending.pop() {
-            if cancel() {
-                return Err(Error::cancelled());
-            }
-            let absolute = if relative.is_empty() {
-                dir.to_owned()
-            } else {
-                path::join(dir, &relative)
-            };
-            for entry in self.list(&absolute)? {
-                let child = path::join(&relative, &entry.name);
-                if entry.is_dir() && !entry.symlink {
-                    pending.push(child.clone());
-                }
-                out.push((child, entry));
-            }
-        }
-        Ok(out)
     }
 
     /// Downloads `remote` to `local`, from `offset` on: 0 writes a new file,
@@ -406,5 +342,59 @@ impl Sftp {
             }
         }
         Ok(done)
+    }
+}
+
+impl crate::remote::Session for Sftp {
+    fn canonicalize(&mut self, path: &str) -> Result<String, Error> {
+        Sftp::canonicalize(self, path)
+    }
+
+    fn list(&mut self, dir: &str) -> Result<Vec<RemoteEntry>, Error> {
+        Sftp::list(self, dir)
+    }
+
+    fn stat(&mut self, path: &str) -> Result<Option<RemoteEntry>, Error> {
+        Sftp::stat(self, path)
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<(), Error> {
+        Sftp::mkdir(self, path)
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), Error> {
+        Sftp::remove_file(self, path)
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<(), Error> {
+        Sftp::remove_dir(self, path)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), Error> {
+        Sftp::rename(self, from, to)
+    }
+
+    fn chmod(&mut self, path: &str, mode: u32) -> Result<(), Error> {
+        Sftp::chmod(self, path, mode)
+    }
+
+    fn download(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        offset: u64,
+        progress: Progress,
+    ) -> Result<u64, Error> {
+        Sftp::download(self, remote, local, offset, progress)
+    }
+
+    fn upload(
+        &mut self,
+        local: &Path,
+        remote: &str,
+        offset: u64,
+        progress: Progress,
+    ) -> Result<u64, Error> {
+        Sftp::upload(self, local, remote, offset, progress)
     }
 }

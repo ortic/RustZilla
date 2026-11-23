@@ -283,6 +283,28 @@ impl Connection {
     }
 }
 
+impl crate::remote::Server for Connection {
+    fn name(&self) -> &str {
+        self.server()
+    }
+
+    fn security(&self) -> crate::remote::Security {
+        crate::remote::Security::Ssh
+    }
+
+    fn open(&self) -> Result<Box<dyn crate::remote::Session>, Error> {
+        Ok(Box::new(self.sftp()?))
+    }
+
+    fn is_closed(&self) -> bool {
+        Connection::is_closed(self)
+    }
+
+    fn disconnect(&self) {
+        Connection::disconnect(self)
+    }
+}
+
 /// The SSH server's address.
 pub(crate) struct Server {
     pub host: String,

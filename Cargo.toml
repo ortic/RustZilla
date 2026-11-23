@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.95"
 
 [workspace.dependencies]
-rustzilla-sftp = { path = "crates/rustzilla-sftp" }
+rustzilla-remote = { path = "crates/rustzilla-remote" }
 
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "glow", "default_fonts", "accesskit", "wayland", "x11", "persistence"] }
 egui = "0.36"
