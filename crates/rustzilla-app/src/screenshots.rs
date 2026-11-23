@@ -502,3 +502,52 @@ fn s3_buckets_and_upload() {
     save(&mut harness, "s3");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn edit_a_remote_file_and_upload_it_again() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("edit");
+    let (local, served) = (dir.join("local"), dir.join("served"));
+    fill(&local, &served);
+    let server = TestServer::start(&served, &dir.join("known_hosts"));
+    let mut harness = harness(false);
+    harness.state_mut().list_local(&local);
+    connect(&mut harness, &server);
+    harness
+        .state_mut()
+        .remote_action(Action::Edit("deploy.sh".into()));
+    wait(&mut harness, "the edited file opened", |_| {
+        edit::OPENED
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.ends_with("deploy.sh"))
+    });
+    let copy = harness.state().tab.edits[0].local.clone();
+    assert_eq!(fs::read_to_string(&copy).unwrap(), "#!/bin/sh\n");
+    // Saved in the editor (a second later: whole-second times).
+    std::thread::sleep(Duration::from_millis(1100));
+    fs::write(&copy, "#!/bin/sh\necho changed\n").unwrap();
+    wait(&mut harness, "the question to upload", |app| {
+        matches!(app.dialog, Some(Dialog::EditChanged { .. }))
+    });
+    save(&mut harness, "edit-changed");
+    harness.get_by_label("Upload").click();
+    wait(&mut harness, "the upload", |_| {
+        fs::read_to_string(served.join("deploy.sh")).unwrap() == "#!/bin/sh\necho changed\n"
+    });
+
+    // A second tab connects to the same server; the first one stays.
+    harness.state_mut().new_tab();
+    assert_eq!(harness.state().tabs.len(), 2);
+    connect(&mut harness, &server);
+    harness.state_mut().switch_to(0);
+    assert!(harness.state().tab.state == ConnState::Connected);
+    assert_eq!(harness.state().tab.edits.len(), 1);
+    harness.state_mut().close_tab(1);
+    assert_eq!(harness.state().tabs.len(), 1);
+    harness.state_mut().stop_editing("/deploy.sh");
+    assert!(!copy.exists());
+    harness.state_mut().disconnect();
+    let _ = fs::remove_dir_all(dir);
+}

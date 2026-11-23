@@ -210,14 +210,34 @@ impl Transfers {
     }
 
     pub fn add(&self, server: &str, items: Vec<NewItem>) {
+        self.add_with(server, items, None);
+    }
+
+    /// Adds transfers that treat an existing target as `exists` says, not
+    /// as the policy does. Returns their ids.
+    pub fn add_with(&self, server: &str, items: Vec<NewItem>, exists: Option<Exists>) -> Vec<u64> {
         let mut queue = self.queue();
+        let mut ids = Vec::new();
         for new in items {
             let id = queue.next_id;
             queue.next_id += 1;
-            queue.items.push(item(id, server, new));
+            let mut item = item(id, server, new);
+            item.exists = exists;
+            queue.items.push(item);
+            ids.push(id);
         }
         drop(queue);
         self.shared.wake.notify_all();
+        ids
+    }
+
+    /// The state of the transfer `id`, if it's still in the queue.
+    pub fn state_of(&self, id: u64) -> Option<State> {
+        self.queue()
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.state.clone())
     }
 
     pub fn cancel(&self, id: u64) {

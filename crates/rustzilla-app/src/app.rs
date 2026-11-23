@@ -152,6 +152,10 @@ enum Dialog {
         mode: u32,
         recursive_note: bool,
     },
+    /// A file opened with View/Edit was saved: upload it?
+    EditChanged {
+        remote: String,
+    },
     Message(String),
     About,
 }
@@ -184,6 +188,8 @@ pub struct Tab {
     /// Synchronized browsing: going into a directory (or up) on one side
     /// does the same on the other.
     sync: bool,
+    /// Remote files open in other apps.
+    edits: Vec<edit::Edited>,
 }
 
 impl Tab {
@@ -203,6 +209,7 @@ impl Tab {
             security_key_login: false,
             site: None,
             sync: false,
+            edits: Vec::new(),
         }
     }
 
@@ -761,6 +768,11 @@ impl App {
                 })
             }
             Action::Permissions(_) => {}
+            Action::Edit(name) => {
+                if let Err(e) = edit::open_with_system(&dir.join(&name)) {
+                    self.log(LogKind::Error, format!("Opening {name}: {e}"));
+                }
+            }
         }
     }
 
@@ -812,6 +824,7 @@ impl App {
                     names,
                 })
             }
+            Action::Edit(name) => self.edit(&name),
             Action::Permissions(names) => {
                 let mode = names
                     .first()
@@ -969,6 +982,21 @@ impl App {
                 if icons::menu_item(ui, Icon::Disconnect, "Disconnect", connected) {
                     self.disconnect();
                     ui.close();
+                }
+                if self.editing() {
+                    ui.separator();
+                    ui.weak("Being edited (click to stop)");
+                    let mut stop = None;
+                    for edited in &self.tab.edits {
+                        let name = path::file_name(&edited.remote);
+                        if icons::menu_item(ui, Icon::External, name, true) {
+                            stop = Some(edited.remote.clone());
+                            ui.close();
+                        }
+                    }
+                    if let Some(remote) = stop {
+                        self.stop_editing(&remote);
+                    }
                 }
                 if !self.sites.is_empty() {
                     ui.separator();
@@ -2082,6 +2110,41 @@ impl App {
                         }
                     });
                 }
+                                Dialog::EditChanged { remote } => {
+                    header(
+                        ui,
+                        Icon::Edit,
+                        "File changed",
+                        &format!(
+                            "“{}” was saved since it was opened. Upload it to the server, \
+                             replacing {remote}?",
+                            path::file_name(remote)
+                        ),
+                    );
+                    buttons(ui, |ui| {
+                        let mut answer = |upload: bool, keep: bool| {
+                            let remote = remote.clone();
+                            then = Some(Box::new(move |app: &mut Self| {
+                                app.edit_changed(&remote, upload, keep)
+                            }));
+                        };
+                        if ui.add(theme::primary_button("Upload")).clicked() || enter {
+                            answer(true, true);
+                            keep = false;
+                        }
+                        if ui.add(theme::secondary_button("Not now")).clicked() {
+                            answer(false, true);
+                            keep = false;
+                        }
+                        if ui
+                            .add(theme::secondary_button("Upload and stop editing"))
+                            .clicked()
+                        {
+                            answer(true, false);
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::Message(text) => {
                     header(ui, Icon::Info, "RustZilla", text.as_str());
                     buttons(ui, |ui| {
@@ -2486,6 +2549,12 @@ impl eframe::App for App {
         self.poll_background(&ctx);
         self.poll_session(&ctx);
         self.poll_transfers();
+        if self.dialog.is_none() {
+            self.poll_edits();
+        }
+        if (0..self.tabs.len()).any(|t| !self.tab_at(t).edits.is_empty()) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
 
         // Files dropped from the desktop go up to the remote directory.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -2604,6 +2673,7 @@ impl eframe::App for App {
         for index in 0..self.tabs.len() {
             self.with_tab(index, Self::disconnect);
         }
+        edit::clean_up();
     }
 }
 
@@ -2874,6 +2944,8 @@ mod tests {
     }
 }
 
+#[path = "edit.rs"]
+mod edit;
 #[path = "search.rs"]
 mod search;
 #[path = "tabs.rs"]

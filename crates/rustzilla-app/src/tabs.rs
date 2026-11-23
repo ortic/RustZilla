@@ -85,6 +85,9 @@ impl App {
                     app.poll_session(ctx);
                 }
                 app.poll_transfers();
+                if free && app.dialog.is_none() {
+                    app.poll_edits();
+                }
             });
             if free && self.dialog.is_some() {
                 self.switch_to(index);

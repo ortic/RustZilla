@@ -67,6 +67,9 @@ pub enum Action {
     Rename(String),
     Delete(Vec<String>),
     Permissions(Vec<String>),
+    /// Opens a file with the system's app for it; a remote one is
+    /// downloaded first and uploaded again when it's saved.
+    Edit(String),
 }
 
 pub struct Pane {
@@ -831,6 +834,18 @@ fn menu(ui: &mut Ui, side: Side, targets: &[String], opens: bool, actions: &mut 
             "Open",
             true,
             Action::Open(targets[0].clone()),
+        );
+    } else if targets.len() == 1 {
+        let label = match side {
+            Side::Local => "Open with the system's app",
+            Side::Remote => "View/Edit",
+        };
+        item(
+            ui,
+            Icon::External,
+            label,
+            true,
+            Action::Edit(targets[0].clone()),
         );
     }
     ui.separator();
