@@ -9,6 +9,7 @@ mod compare;
 mod config;
 mod format;
 mod icons;
+mod import;
 mod local;
 mod pane;
 mod secrets;

@@ -152,6 +152,11 @@ enum Dialog {
         mode: u32,
         recursive_note: bool,
     },
+    /// Bookmarks the directories shown.
+    Bookmark {
+        name: String,
+        for_site: bool,
+    },
     /// A file opened with View/Edit was saved: upload it?
     EditChanged {
         remote: String,
@@ -230,6 +235,7 @@ pub struct App {
     ctx: egui::Context,
     paths: Option<Paths>,
     sites: Vec<Site>,
+    bookmarks: Vec<config::Bookmark>,
     settings: Settings,
     quick_password: String,
     log: Vec<LogLine>,
@@ -262,10 +268,18 @@ impl App {
             }),
             None => Vec::new(),
         };
+        let bookmarks = match &paths {
+            Some(paths) => config::load_bookmarks(paths).unwrap_or_else(|e| {
+                problems.push(e);
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
         let mut app = Self {
             ctx: cc.egui_ctx.clone(),
             paths,
             sites,
+            bookmarks,
             tab: Tab::new(settings.exists),
             tabs: vec![Tab::new(settings.exists)],
             active: 0,
@@ -965,6 +979,21 @@ impl App {
                     self.open_site_manager(None);
                     ui.close();
                 }
+                ui.menu_button("Import sites", |ui| {
+                    ui.set_min_width(220.0);
+                    if icons::menu_item(ui, Icon::Import, "From FileZilla", true) {
+                        self.import_sites(false, false);
+                        ui.close();
+                    }
+                    if icons::menu_item(ui, Icon::Import, "From a FileZilla file…", true) {
+                        self.import_sites(false, true);
+                        ui.close();
+                    }
+                    if icons::menu_item(ui, Icon::Key, "From ~/.ssh/config", true) {
+                        self.import_sites(true, false);
+                        ui.close();
+                    }
+                });
                 if icons::menu_item(ui, Icon::Plus, "New tab   Ctrl+T", true) {
                     self.new_tab();
                     ui.close();
@@ -1062,6 +1091,8 @@ impl App {
                 }
             });
             menus.push(transfer.response);
+            let bookmarks = ui.menu_button("Bookmarks", |ui| self.bookmarks_menu(ui));
+            menus.push(bookmarks.response);
             let view = ui.menu_button("View", |ui| {
                 ui.set_min_width(200.0);
                 ui.checkbox(&mut self.settings.show_log, "Message log");
@@ -1139,6 +1170,183 @@ impl App {
     fn reconnect(&mut self, ctx: &egui::Context) {
         if let Some(attempt) = self.tab.attempt.clone() {
             self.connect(ctx, attempt);
+        }
+    }
+
+    /// Adds the sites of FileZilla (`ssh` false) or of `~/.ssh/config`;
+    /// `pick` asks for the file.
+    fn import_sites(&mut self, ssh: bool, pick: bool) {
+        let file = if pick {
+            let mut dialog = rfd::FileDialog::new().set_title(if ssh {
+                "OpenSSH client configuration"
+            } else {
+                "FileZilla's sitemanager.xml"
+            });
+            if !ssh {
+                dialog = dialog.add_filter("FileZilla sites", &["xml"]);
+            }
+            dialog.pick_file()
+        } else if ssh {
+            crate::import::ssh_config_file()
+        } else {
+            crate::import::filezilla_file()
+        };
+        let Some(file) = file else {
+            if !pick {
+                let what = if ssh {
+                    "There's no ~/.ssh/config."
+                } else {
+                    "FileZilla's sites weren't found. Choose its sitemanager.xml with \
+                     File → Import sites → From a FileZilla file…"
+                };
+                self.dialog = Some(Dialog::Message(what.into()));
+            }
+            return;
+        };
+        let found = if ssh {
+            crate::import::read_ssh_config(&file)
+        } else {
+            crate::import::read_filezilla(&file)
+        };
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => {
+                self.dialog = Some(Dialog::Message(format!("Importing failed: {e}")));
+                return;
+            }
+        };
+        let (mut added, mut there) = (0, 0);
+        for imported in found.sites {
+            if crate::import::known(&self.sites, &imported.site) {
+                there += 1;
+                continue;
+            }
+            if let Some(password) = &imported.password
+                && let Err(e) = crate::secrets::store(&imported.site.id, password)
+            {
+                self.log(LogKind::Error, format!("{}: {e}", imported.site.name));
+            }
+            self.sites.push(imported.site);
+            added += 1;
+        }
+        if let Some(paths) = &self.paths
+            && let Err(e) = config::save_sites(paths, &self.sites)
+        {
+            self.log(LogKind::Error, e);
+        }
+        let mut text = format!("Imported {added} sites from {}.", file.display());
+        if there > 0 {
+            text.push_str(&format!(" {there} were in the Site Manager already."));
+        }
+        if !found.skipped.is_empty() {
+            text.push_str(&format!(" Not imported: {}.", found.skipped.join("; ")));
+        }
+        self.log(LogKind::Status, text.clone());
+        self.dialog = Some(Dialog::Message(text));
+    }
+
+    /// The bookmarks for every connection and for the tab's site.
+    fn shown_bookmarks(&self) -> Vec<(usize, &config::Bookmark)> {
+        let site = self.tab.site.as_ref().map(|s| s.id.as_str());
+        self.bookmarks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.site.is_empty() || Some(b.site.as_str()) == site)
+            .collect()
+    }
+
+    fn bookmarks_menu(&mut self, ui: &mut Ui) {
+        ui.set_min_width(220.0);
+        if icons::menu_item(ui, Icon::Bookmark, "Add bookmark…", true) {
+            let name = path::file_name(&self.tab.remote.path).to_owned();
+            let name = if name.is_empty() || self.tab.state != ConnState::Connected {
+                Path::new(&self.tab.local.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            } else {
+                name
+            };
+            self.dialog = Some(Dialog::Bookmark {
+                name,
+                for_site: self.tab.site.is_some(),
+            });
+            ui.close();
+        }
+        let shown: Vec<(usize, config::Bookmark)> = self
+            .shown_bookmarks()
+            .into_iter()
+            .map(|(i, b)| (i, b.clone()))
+            .collect();
+        if shown.is_empty() {
+            return;
+        }
+        ui.separator();
+        let mut go = None;
+        for (_, bookmark) in &shown {
+            if icons::menu_item(ui, Icon::Bookmark, &bookmark.name, true) {
+                go = Some(bookmark.clone());
+                ui.close();
+            }
+        }
+        ui.separator();
+        let mut remove = None;
+        ui.menu_button("Remove a bookmark", |ui| {
+            for (index, bookmark) in &shown {
+                if icons::menu_item(ui, Icon::Trash, &bookmark.name, true) {
+                    remove = Some(*index);
+                    ui.close();
+                }
+            }
+        });
+        if let Some(bookmark) = go {
+            self.go_to_bookmark(&bookmark);
+        }
+        if let Some(index) = remove {
+            self.bookmarks.remove(index);
+            self.save_bookmarks();
+        }
+    }
+
+    fn go_to_bookmark(&mut self, bookmark: &config::Bookmark) {
+        if !bookmark.local.is_empty() {
+            self.list_local(&PathBuf::from(&bookmark.local));
+        }
+        if !bookmark.remote.is_empty() {
+            if self.tab.state == ConnState::Connected {
+                self.list_remote(bookmark.remote.clone());
+            } else {
+                self.log(
+                    LogKind::Status,
+                    format!("Connect to open {} on the server", bookmark.remote),
+                );
+            }
+        }
+    }
+
+    fn add_bookmark(&mut self, name: &str, for_site: bool) {
+        let connected = self.tab.state == ConnState::Connected;
+        self.bookmarks.push(config::Bookmark {
+            name: name.to_owned(),
+            local: self.tab.local.path.clone(),
+            remote: if connected {
+                self.tab.remote.path.clone()
+            } else {
+                String::new()
+            },
+            site: match (&self.tab.site, for_site) {
+                (Some(site), true) => site.id.clone(),
+                _ => String::new(),
+            },
+        });
+        self.save_bookmarks();
+    }
+
+    fn save_bookmarks(&mut self) {
+        if let Some(paths) = &self.paths
+            && let Err(e) = config::save_bookmarks(paths, &self.bookmarks)
+        {
+            self.log(LogKind::Error, e);
         }
     }
 
@@ -2110,7 +2318,48 @@ impl App {
                         }
                     });
                 }
-                                Dialog::EditChanged { remote } => {
+                                                Dialog::Bookmark { name, for_site } => {
+                    let remote = if self.tab.state == ConnState::Connected {
+                        self.tab.remote.path.as_str()
+                    } else {
+                        "—"
+                    };
+                    header(
+                        ui,
+                        Icon::Bookmark,
+                        "Add bookmark",
+                        &format!(
+                            "This computer: {}\nThe server: {remote}",
+                            self.tab.local.path
+                        ),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("Name of the bookmark")
+                            .margin(egui::Margin::symmetric(8, 6))
+                            .desired_width(f32::INFINITY),
+                    )
+                    .request_focus();
+                    if let Some(site) = &self.tab.site {
+                        ui.checkbox(for_site, format!("Only for the site {}", site.name));
+                    }
+                    buttons(ui, |ui| {
+                        let ready = !name.trim().is_empty();
+                        if ui.add_enabled(ready, theme::primary_button("Add")).clicked()
+                            || (enter && ready)
+                        {
+                            let (name, for_site) = (name.trim().to_owned(), *for_site);
+                            then = Some(Box::new(move |app: &mut Self| {
+                                app.add_bookmark(&name, for_site)
+                            }));
+                            keep = false;
+                        }
+                        if ui.add(theme::secondary_button("Cancel")).clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::EditChanged { remote } => {
                     header(
                         ui,
                         Icon::Edit,

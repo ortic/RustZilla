@@ -42,10 +42,55 @@ impl Paths {
         self.config_dir.join("sites.toml")
     }
 
+    fn bookmarks_file(&self) -> PathBuf {
+        self.config_dir.join("bookmarks.toml")
+    }
+
     /// The transfers left at the end of the last run.
     fn queue_file(&self) -> PathBuf {
         self.data_dir.join("queue.toml")
     }
+}
+
+/// A place to go back to: a local and a remote directory (either may be
+/// empty), for one site or for any connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Bookmark {
+    pub name: String,
+    pub local: String,
+    pub remote: String,
+    /// The site's id; empty for every connection.
+    pub site: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct BookmarksFile {
+    #[serde(default, rename = "bookmark")]
+    bookmarks: Vec<Bookmark>,
+}
+
+pub fn load_bookmarks(paths: &Paths) -> Result<Vec<Bookmark>, String> {
+    let file = paths.bookmarks_file();
+    let text = match fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("reading {}: {e}", file.display())),
+    };
+    toml::from_str::<BookmarksFile>(&text)
+        .map(|f| f.bookmarks)
+        .map_err(|e| format!("reading {}: {e}", file.display()))
+}
+
+pub fn save_bookmarks(paths: &Paths, bookmarks: &[Bookmark]) -> Result<(), String> {
+    let file = paths.bookmarks_file();
+    let text = toml::to_string_pretty(&BookmarksFile {
+        bookmarks: bookmarks.to_vec(),
+    })
+    .map_err(|e| e.to_string())?;
+    fs::create_dir_all(&paths.config_dir)
+        .and_then(|()| fs::write(&file, text))
+        .map_err(|e| format!("saving {}: {e}", file.display()))
 }
 
 /// A transfer kept for the next run, with the server it's for.
@@ -295,6 +340,15 @@ mod tests {
         assert_eq!(load_queue(&paths).unwrap(), queue);
         save_queue(&paths, Vec::new()).unwrap();
         assert!(load_queue(&paths).unwrap().is_empty());
+
+        let bookmarks = vec![Bookmark {
+            name: "Logs".into(),
+            remote: "/var/log".into(),
+            site: "site-1".into(),
+            ..Bookmark::default()
+        }];
+        save_bookmarks(&paths, &bookmarks).unwrap();
+        assert_eq!(load_bookmarks(&paths).unwrap(), bookmarks);
         let _ = fs::remove_dir_all(dir);
     }
 

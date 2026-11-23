@@ -5401,6 +5401,7 @@ dependencies = [
  "keyring",
  "resvg",
  "rfd",
+ "roxmltree 0.21.2",
  "rustzilla-remote",
  "serde",
  "toml 0.9.12+spec-1.1.0",
