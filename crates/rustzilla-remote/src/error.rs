@@ -23,7 +23,7 @@ pub enum ErrorKind {
     Pin,
     /// The key file needs its passphrase, or it was wrong.
     Passphrase,
-    /// The transfer was cancelled.
+    /// The transfer was cancelled, or the login (by the user).
     Cancelled,
     /// The SSH connection is gone: connect again.
     Disconnected,

@@ -415,9 +415,12 @@ py6rf5td32GSy2DzHbe9AAAABWhvc3Qx
             pin: None,
             known_hosts,
             on_touch: None,
+            on_prompt: None,
+            jump: None,
         };
         let server = super::super::Server::new(&params.host, params.port).unwrap();
-        let result = runtime.block_on(super::super::login(&server, &params));
+        let deadline = super::super::Deadline::new(std::time::Duration::from_secs(30));
+        let result = runtime.block_on(super::super::login(&server, &params, &deadline));
         crate::fido::soft::PLUGGED_IN.lock().unwrap().take();
         result.map(drop)
     }

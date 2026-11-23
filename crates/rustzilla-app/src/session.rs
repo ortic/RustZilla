@@ -38,6 +38,9 @@ pub enum Event {
     Log(LogKind, String),
     /// The security key waits to be touched.
     Touch,
+    /// The server asks something to log in (a one-time code): the session
+    /// waits for the answers.
+    Prompt(crate::prompt::Request),
     Connected {
         connection: Arc<dyn Server>,
         home: String,
@@ -85,8 +88,19 @@ impl Session {
                 ctx.request_repaint();
             })
         };
+        let prompt = {
+            let events = std::sync::Mutex::new(events.clone());
+            let ctx = ctx.clone();
+            crate::prompt::asker(move |request| {
+                if let Ok(events) = events.lock() {
+                    let _ = events.send(Event::Prompt(request));
+                }
+                ctx.request_repaint();
+            })
+        };
         if let Params::Sftp(ssh) = &mut params {
             ssh.on_touch = Some(touch);
+            ssh.on_prompt = Some(prompt);
         }
         thread::Builder::new()
             .name("session".into())

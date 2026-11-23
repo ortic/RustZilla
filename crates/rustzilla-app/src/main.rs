@@ -10,6 +10,7 @@ mod format;
 mod icons;
 mod local;
 mod pane;
+mod prompt;
 mod secrets;
 mod session;
 mod site_manager;

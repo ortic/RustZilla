@@ -108,6 +108,9 @@ pub struct Site {
     pub region: String,
     /// Opened on the local side after connecting, if set.
     pub local_dir: String,
+    /// SFTP through this jump host, `[user@]host[:port]` as `ssh -J`;
+    /// empty for none.
+    pub jump_host: String,
 }
 
 impl Default for Site {
@@ -125,6 +128,7 @@ impl Default for Site {
             remote_dir: String::new(),
             region: String::new(),
             local_dir: String::new(),
+            jump_host: String::new(),
         }
     }
 }
@@ -184,6 +188,7 @@ mod tests {
                 user: "deploy".into(),
                 logon: Logon::KeyFile,
                 key_file: "~/.ssh/id_ecdsa_sk".into(),
+                jump_host: "admin@bastion.example.com:2222".into(),
                 ..Site::default()
             },
             Site::default(),
@@ -191,5 +196,16 @@ mod tests {
         save_sites(&paths, &sites).unwrap();
         assert_eq!(load_sites(&paths).unwrap(), sites);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Sites saved before a setting existed load with its default.
+    #[test]
+    fn old_sites_load() {
+        let file: SitesFile = toml::from_str(
+            "[[site]]\nid = \"site-1\"\nname = \"old\"\nprotocol = \"sftp\"\nhost = \"example.com\"\n",
+        )
+        .unwrap();
+        assert_eq!(file.sites[0].host, "example.com");
+        assert_eq!(file.sites[0].jump_host, "");
     }
 }

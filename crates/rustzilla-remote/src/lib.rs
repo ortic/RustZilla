@@ -28,7 +28,10 @@ pub use ftp::{FtpParams, FtpServer};
 pub use remote::{FtpEncryption, Params, Protocol, Security, Server, Session, connect};
 pub use s3::S3Params;
 pub use sftp::{EntryKind, Progress, RemoteEntry, Sftp};
-pub use ssh::{Auth, Connection, HostKey, SshParams, is_encrypted_key, is_security_key};
+pub use ssh::{
+    Auth, Connection, HostKey, Jump, OnPrompt, Prompt, Prompts, SshParams, is_encrypted_key,
+    is_security_key,
+};
 pub use tls::Certificate;
 pub use webdav::WebDavParams;
 

@@ -18,6 +18,7 @@ use crate::format;
 use crate::icons::{self, Icon};
 use crate::local;
 use crate::pane::{Action, Pane, Row, Side};
+use crate::prompt::PromptDialog;
 use crate::session::{Command, Event, LogKind, Session};
 use crate::site_manager::{self, SiteManager};
 use crate::theme;
@@ -170,6 +171,8 @@ pub struct App {
     attempt: Option<Attempt>,
     transfers: Transfers,
     dialog: Option<Dialog>,
+    /// What the server asks to log in, the session waiting.
+    prompt: Option<PromptDialog>,
     site_manager: Option<SiteManager>,
     /// The pane keys act on.
     focus: Side,
@@ -212,6 +215,7 @@ impl App {
             state: ConnState::Idle,
             attempt: None,
             dialog: None,
+            prompt: None,
             site_manager: None,
             focus: Side::Local,
             queue_tab: QueueTab::Queued,
@@ -294,6 +298,8 @@ impl App {
                 pin: None,
                 known_hosts: self.known_hosts(),
                 on_touch: None,
+                on_prompt: None,
+                jump: None,
             }),
             Protocol::Ftp => Params::Ftp(FtpParams {
                 host,
@@ -389,7 +395,7 @@ impl App {
         } else {
             site.user.trim().to_owned()
         };
-        let attempt = Attempt {
+        let mut attempt = Attempt {
             params: self.params(Login {
                 protocol: site.protocol,
                 encryption: site.encryption,
@@ -402,6 +408,15 @@ impl App {
             }),
             remote_dir: site.remote_dir.clone(),
         };
+        if let Params::Sftp(ssh) = &mut attempt.params {
+            match rustzilla_remote::Jump::parse(&site.jump_host) {
+                Ok(jump) => ssh.jump = jump,
+                Err(e) => {
+                    self.dialog = Some(Dialog::Message(format!("Can't connect: {e}.")));
+                    return;
+                }
+            }
+        }
         if site.logon == Logon::AskPassword {
             self.dialog = Some(Dialog::Secret {
                 kind: SecretKind::Password,
@@ -445,6 +460,8 @@ impl App {
         if let Some(session) = self.session.take() {
             session.send(Command::Disconnect);
         }
+        // Unanswered, the login is cancelled.
+        self.prompt = None;
         self.transfers.stop();
         self.connection = None;
         if self.state != ConnState::Idle {
@@ -463,6 +480,7 @@ impl App {
                     self.state = ConnState::Connecting { touch: true };
                     self.log(LogKind::Status, "Touch your security key".into());
                 }
+                Event::Prompt(request) => self.prompt = Some(PromptDialog::new(request)),
                 Event::Connected { connection, home } => {
                     self.log(
                         LogKind::Status,
@@ -481,6 +499,7 @@ impl App {
                 }
                 Event::Failed(error) => {
                     self.session = None;
+                    self.prompt = None;
                     self.state = ConnState::Idle;
                     self.remote.clear("Not connected to any server");
                     let attempt = self.attempt.clone().map(Box::new);
@@ -2251,6 +2270,11 @@ impl eframe::App for App {
         self.site_manager_ui(&ctx);
         self.touch_overlay(&ctx);
         self.dialogs(&ctx);
+        if let Some(prompt) = &mut self.prompt
+            && !prompt.show(&ctx)
+        {
+            self.prompt = None;
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
