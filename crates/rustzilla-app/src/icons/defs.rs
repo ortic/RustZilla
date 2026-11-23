@@ -353,5 +353,29 @@ pub fn def(icon: Icon) -> Def {
             "quit",
             r#"<path d="M6.25 2.25h-2.5a1.5 1.5 0 0 0-1.5 1.5v8.5a1.5 1.5 0 0 0 1.5 1.5h2.5" stroke="$A"/><path d="M6.5 8h7.25M10.75 5l3 3-3 3" stroke="$A"/>"#,
         ),
+        Icon::Compare => mono(
+            "compare",
+            r#"<rect x="1.75" y="2.25" width="5" height="11.5" rx="1.25" stroke="$A" fill="$A" fill-opacity=".15"/><rect x="9.25" y="2.25" width="5" height="11.5" rx="1.25" stroke="$A" fill="$A" fill-opacity=".15"/><path d="M3.5 5.5h1.5M3.5 8h1.5M11 5.5h1.5M11 10.5h1.5" stroke="$A"/>"#,
+        ),
+        Icon::Sync => mono(
+            "sync",
+            r#"<path d="M2.75 6.25h9.5l-2.5-2.5M13.25 9.75h-9.5l2.5 2.5" stroke="$A"/>"#,
+        ),
+        Icon::Bookmark => mono(
+            "bookmark",
+            r#"<path d="M4 2.25h8a.75.75 0 0 1 .75.75v10.75L8 10.75l-4.75 3V3A.75.75 0 0 1 4 2.25z" stroke="$A" fill="$A" fill-opacity=".2"/>"#,
+        ),
+        Icon::Search => mono(
+            "search",
+            r#"<circle cx="7" cy="7" r="4.5" stroke="$A" fill="$A" fill-opacity=".15"/><path d="M10.4 10.4l3.35 3.35" stroke="$A"/>"#,
+        ),
+        Icon::Import => mono(
+            "import",
+            r#"<path d="M2.25 10v2.5a1.25 1.25 0 0 0 1.25 1.25h9a1.25 1.25 0 0 0 1.25-1.25V10" stroke="$A"/><path d="M8 2.25v7.5M5 6.75l3 3 3-3" stroke="$A"/>"#,
+        ),
+        Icon::External => mono(
+            "external",
+            r#"<path d="M7 3.25H3.75a1.5 1.5 0 0 0-1.5 1.5v7.5a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5V9" stroke="$A"/><path d="M9.25 2.25h4.5v4.5M13.5 2.5 7.75 8.25" stroke="$A"/>"#,
+        ),
     }
 }

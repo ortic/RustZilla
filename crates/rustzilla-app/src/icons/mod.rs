@@ -45,7 +45,7 @@ icons! {
     Error, Warning, Info, Success, Lock, Command,
     // generic ui
     Refresh, Filter, Edit, Trash, Copy, Log, Close, ChevronDown, Plus, Sun,
-    Moon, Quit,
+    Moon, Quit, Compare, Sync, Bookmark, Search, Import, External,
 }
 
 struct Rendered {

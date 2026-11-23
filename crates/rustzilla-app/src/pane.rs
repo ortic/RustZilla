@@ -2,12 +2,13 @@
 //! path, then its entries in a table, sortable, with a selection, a context
 //! menu, and dragging to the other side.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use egui::{Align, Layout, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 
+use crate::compare::Mark;
 use crate::format;
 use crate::icons::{self, Icon};
 use crate::theme;
@@ -84,6 +85,17 @@ pub struct Pane {
     sort: SortBy,
     ascending: bool,
     pub filter: String,
+    /// Directory comparison's marks, by name; empty when not comparing.
+    pub marks: HashMap<String, Mark>,
+    /// Whether keys act on this pane.
+    pub focused: bool,
+    /// The row to scroll to, after moving with keys.
+    scroll_to: Option<usize>,
+    /// What's been typed to find an entry, and when.
+    typed: String,
+    typed_at: f64,
+    /// Selected once the listing of the directory comes in.
+    pub select_after: Option<String>,
 }
 
 impl Pane {
@@ -100,6 +112,12 @@ impl Pane {
             sort: SortBy::Name,
             ascending: true,
             filter: String::new(),
+            marks: HashMap::new(),
+            focused: false,
+            scroll_to: None,
+            typed: String::new(),
+            typed_at: 0.0,
+            select_after: None,
         }
     }
 
@@ -120,6 +138,114 @@ impl Pane {
         self.message = None;
         self.busy = false;
         self.sort_rows();
+        if let Some(name) = self.select_after.take() {
+            self.select(&name);
+        }
+    }
+
+    /// Selects the entry `name` alone and scrolls to it.
+    pub fn select(&mut self, name: &str) {
+        let visible = self.visible();
+        if let Some(position) = visible.iter().position(|&i| self.rows[i].name == name) {
+            self.selected.clear();
+            self.selected.insert(name.to_owned());
+            self.anchor = Some(position);
+            self.scroll_to = Some(position);
+        }
+    }
+
+    /// The keys of a file list: arrows, Page Up/Down, Home/End (Shift
+    /// extends the selection), Enter, and typing a name's start.
+    pub fn keys(&mut self, ctx: &egui::Context) -> Vec<Action> {
+        use egui::Key;
+        let visible = self.visible();
+        let mut actions = Vec::new();
+        if visible.is_empty() || self.message.is_some() {
+            return actions;
+        }
+        let (moves, enter, typed, shift, command, time) = ctx.input(|i| {
+            let mut moves: Vec<isize> = Vec::new();
+            for (key, step) in [
+                (Key::ArrowDown, 1),
+                (Key::ArrowUp, -1),
+                (Key::PageDown, 15),
+                (Key::PageUp, -15),
+                (Key::End, isize::MAX / 2),
+                (Key::Home, -isize::MAX / 2),
+            ] {
+                if i.key_pressed(key) {
+                    moves.push(step);
+                }
+            }
+            let typed: String = i
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect();
+            (
+                moves,
+                i.key_pressed(Key::Enter),
+                typed,
+                i.modifiers.shift,
+                i.modifiers.command,
+                i.time,
+            )
+        });
+        let last = visible.len() as isize - 1;
+        for step in moves {
+            let from = self.anchor.map_or(-1, |a| a as isize);
+            let to = if from < 0 && step > 0 {
+                0
+            } else {
+                (from + step).clamp(0, last)
+            } as usize;
+            if shift {
+                let start = self.anchor.unwrap_or(to);
+                if !command {
+                    self.selected.clear();
+                }
+                let (a, b) = (start.min(to), start.max(to));
+                for &i in &visible[a..=b] {
+                    self.selected.insert(self.rows[i].name.clone());
+                }
+                // The selection grows from where it started.
+                self.anchor = Some(to);
+            } else {
+                self.selected.clear();
+                self.selected.insert(self.rows[visible[to]].name.clone());
+                self.anchor = Some(to);
+            }
+            self.scroll_to = Some(to);
+        }
+        let typed: String = typed.chars().filter(|c| !c.is_control()).collect();
+        if !typed.is_empty() && !command {
+            if time - self.typed_at > 1.0 {
+                self.typed.clear();
+            }
+            self.typed_at = time;
+            self.typed.push_str(&typed.to_lowercase());
+            let found = visible
+                .iter()
+                .position(|&i| self.rows[i].name.to_lowercase().starts_with(&self.typed));
+            if let Some(position) = found {
+                let name = self.rows[visible[position]].name.clone();
+                self.select(&name);
+            }
+        }
+        if enter && self.selected.len() == 1 {
+            let name = self.selected().remove(0);
+            match self.row(&name) {
+                Some(row) if row.is_dir => actions.push(Action::Open(name)),
+                Some(_) => actions.push(Action::Transfer(vec![name])),
+                None => {}
+            }
+        } else if enter && self.selected.len() > 1 {
+            actions.push(Action::Transfer(self.selected()));
+        }
+        actions
     }
 
     pub fn clear(&mut self, message: impl Into<String>) {
@@ -255,12 +381,20 @@ impl Pane {
                     if self.message.is_none() {
                         ui.weak(self.summary());
                     }
+                    if !self.marks.is_empty() {
+                        ui.with_layout(Layout::right_to_left(Align::Center), legend);
+                    }
                 });
             });
 
+        let stroke = if self.focused && enabled {
+            egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.7))
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke
+        };
         let frame = egui::Frame::NONE
             .fill(ui.visuals().extreme_bg_color)
-            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .stroke(stroke)
             .corner_radius(6)
             .inner_margin(egui::Margin::same(1));
         // A drop zone of our own: egui's paints over the frame's fill.
@@ -363,8 +497,12 @@ impl Pane {
         let visible = self.visible();
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
         let remote = self.side == Side::Remote;
-        let mut table = TableBuilder::new(ui)
-            .id_salt(("pane", remote))
+        let mut table = TableBuilder::new(ui).id_salt(("pane", remote));
+        if let Some(position) = self.scroll_to.take() {
+            // Row 0 is "..".
+            table = table.scroll_to_row(position + 1, None);
+        }
+        let mut table = table
             .striped(true)
             .resizable(true)
             .auto_shrink(false)
@@ -408,6 +546,7 @@ impl Pane {
         let mut dragged: Option<(usize, egui::Response)> = None;
         let selected = &self.selected;
         let rows = &self.rows;
+        let marks = &self.marks;
         let side = self.side;
         table
             .header(row_height + 2.0, |mut header| {
@@ -464,8 +603,10 @@ impl Pane {
                     }
                     let index = visible[row.index() - 1];
                     let entry = &rows[index];
+                    let mark = marks.get(&entry.name).copied();
                     row.set_selected(selected.contains(&entry.name));
                     row.col(|ui| {
+                        tint(ui, mark);
                         let icon = if entry.is_dir {
                             Icon::Folder
                         } else {
@@ -482,6 +623,7 @@ impl Pane {
                         ui.add(egui::Label::new(name).selectable(false).truncate());
                     });
                     row.col(|ui| {
+                        tint(ui, mark);
                         if !entry.is_dir {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.add(
@@ -492,6 +634,7 @@ impl Pane {
                         }
                     });
                     row.col(|ui| {
+                        tint(ui, mark);
                         let kind = if entry.is_dir {
                             "Directory".to_owned()
                         } else {
@@ -505,9 +648,11 @@ impl Pane {
                         );
                     });
                     row.col(|ui| {
+                        tint(ui, mark);
                         ui.add(egui::Label::new(format::time(entry.modified)).selectable(false));
                     });
                     row.col(|ui| {
+                        tint(ui, mark);
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format::permissions(entry))
@@ -519,6 +664,7 @@ impl Pane {
                     });
                     if remote {
                         row.col(|ui| {
+                            tint(ui, mark);
                             ui.add(egui::Label::new(&entry.owner).selectable(false));
                         });
                     }
@@ -621,6 +767,38 @@ impl Pane {
     pub fn select_all(&mut self) {
         let visible = self.visible();
         self.selected = visible.iter().map(|&i| self.rows[i].name.clone()).collect();
+    }
+}
+
+/// The background of a compared entry.
+fn tint(ui: &Ui, mark: Option<Mark>) {
+    let Some(mark) = mark else { return };
+    let (r, g, b) = mark_rgb(mark);
+    let rect = ui.max_rect().expand2(egui::vec2(4.0, 2.0));
+    ui.painter()
+        .rect_filled(rect, 0, egui::Color32::from_rgba_unmultiplied(r, g, b, 48));
+}
+
+fn mark_rgb(mark: Mark) -> (u8, u8, u8) {
+    match mark {
+        Mark::Only => (0xe0, 0xaa, 0x1c),
+        Mark::Newer => (0x36, 0xa8, 0x5f),
+        Mark::Different => (0xe2, 0x50, 0x4a),
+    }
+}
+
+/// What comparison's colors mean.
+fn legend(ui: &mut Ui) {
+    for (mark, label) in [
+        (Mark::Different, "Other size"),
+        (Mark::Newer, "Newer"),
+        (Mark::Only, "Only here"),
+    ] {
+        ui.weak(label);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+        let (r, g, b) = mark_rgb(mark);
+        ui.painter()
+            .rect_filled(rect, 2, egui::Color32::from_rgb(r, g, b));
     }
 }
 

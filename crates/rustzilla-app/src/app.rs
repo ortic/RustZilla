@@ -43,6 +43,8 @@ struct Settings {
     /// Speed limits in KiB/s; 0 for none.
     limit_down: u64,
     limit_up: u64,
+    /// Directory comparison: marks what differs between the sides.
+    compare: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -76,6 +78,7 @@ impl Default for Settings {
             theme: ThemePref::System,
             limit_down: 0,
             limit_up: 0,
+            compare: false,
         }
     }
 }
@@ -178,6 +181,9 @@ pub struct Tab {
     security_key_login: bool,
     /// The saved site connected to, for its bookmarks.
     site: Option<Site>,
+    /// Synchronized browsing: going into a directory (or up) on one side
+    /// does the same on the other.
+    sync: bool,
 }
 
 impl Tab {
@@ -196,6 +202,7 @@ impl Tab {
             remote_home: String::new(),
             security_key_login: false,
             site: None,
+            sync: false,
         }
     }
 
@@ -226,6 +233,8 @@ pub struct App {
     active: usize,
     dialog: Option<Dialog>,
     site_manager: Option<SiteManager>,
+    /// The Find files window.
+    search: Option<search::Search>,
     queue_tab: QueueTab,
     /// The exists dialog's choice.
     exists_choice: Exists,
@@ -258,6 +267,7 @@ impl App {
             log: Vec::new(),
             dialog: None,
             site_manager: None,
+            search: None,
             queue_tab: QueueTab::Queued,
             exists_choice: Exists::Overwrite,
             exists_all: false,
@@ -619,6 +629,9 @@ impl App {
                 }
                 Event::ListFailed { path } => {
                     self.tab.remote.busy = false;
+                    if self.tab.sync {
+                        self.stop_sync(&format!("{path} isn't on the server"));
+                    }
                     if self.tab.remote.path.is_empty() {
                         // The start directory isn't there: the home one.
                         self.log(
@@ -706,10 +719,20 @@ impl App {
     fn local_action(&mut self, action: Action) {
         let dir = PathBuf::from(&self.tab.local.path);
         match action {
-            Action::Open(name) => self.list_local(&dir.join(name)),
+            Action::Open(name) => {
+                self.list_local(&dir.join(&name));
+                if self.syncing() {
+                    let remote = path::join(&self.tab.remote.path, &name);
+                    self.list_remote(remote);
+                }
+            }
             Action::Up => {
                 if let Some(parent) = dir.parent() {
                     self.list_local(parent);
+                }
+                if self.syncing() {
+                    let remote = path::parent(&self.tab.remote.path);
+                    self.list_remote(remote);
                 }
             }
             Action::Navigate(path) => self.list_local(&site_manager::expand_home(&path)),
@@ -744,8 +767,26 @@ impl App {
     fn remote_action(&mut self, action: Action) {
         let dir = self.tab.remote.path.clone();
         match action {
-            Action::Open(name) => self.list_remote(path::join(&dir, &name)),
-            Action::Up => self.list_remote(path::parent(&dir)),
+            Action::Open(name) => {
+                self.list_remote(path::join(&dir, &name));
+                if self.syncing() {
+                    let local = PathBuf::from(&self.tab.local.path).join(&name);
+                    if local.is_dir() {
+                        self.list_local(&local);
+                    } else {
+                        self.stop_sync(&format!("{} isn't on this computer", local.display()));
+                    }
+                }
+            }
+            Action::Up => {
+                self.list_remote(path::parent(&dir));
+                if self.syncing() {
+                    let local = PathBuf::from(&self.tab.local.path);
+                    if let Some(parent) = local.parent() {
+                        self.list_local(parent);
+                    }
+                }
+            }
             Action::Navigate(path) => self.list_remote(path),
             Action::Home => self.list_remote(self.tab.remote_home.clone()),
             Action::SiteManager => self.open_site_manager(None),
@@ -786,6 +827,46 @@ impl App {
                     recursive_note,
                 });
             }
+        }
+    }
+
+    fn syncing(&self) -> bool {
+        self.tab.sync && self.tab.state == ConnState::Connected
+    }
+
+    fn stop_sync(&mut self, why: &str) {
+        self.tab.sync = false;
+        self.log(
+            LogKind::Error,
+            format!("{why}: synchronized browsing is off"),
+        );
+    }
+
+    /// Synchronized browsing starts where both sides are.
+    fn toggle_sync(&mut self) {
+        self.tab.sync = !self.tab.sync;
+        if self.tab.sync {
+            let text = format!(
+                "Synchronized browsing: {} and {} go along",
+                self.tab.local.path, self.tab.remote.path
+            );
+            self.log(LogKind::Status, text);
+        }
+    }
+
+    /// Marks what differs between the sides, if comparing.
+    fn update_marks(&mut self) {
+        let tab = &mut self.tab;
+        if self.settings.compare
+            && tab.state == ConnState::Connected
+            && tab.remote.message.is_none()
+        {
+            let (local, remote) = crate::compare::compare(&tab.local.rows, &tab.remote.rows);
+            tab.local.marks = local;
+            tab.remote.marks = remote;
+        } else {
+            tab.local.marks.clear();
+            tab.remote.marks.clear();
         }
     }
 
@@ -971,6 +1052,16 @@ impl App {
                     }
                 }
                 ui.separator();
+                if icons::menu_item(ui, Icon::Search, "Find files…   Ctrl+F", true) {
+                    self.open_search();
+                    ui.close();
+                }
+                ui.checkbox(&mut self.settings.compare, "Directory comparison");
+                let mut sync = self.tab.sync;
+                if ui.checkbox(&mut sync, "Synchronized browsing").changed() {
+                    self.toggle_sync();
+                }
+                ui.separator();
                 if icons::menu_item(ui, Icon::Refresh, "Refresh both sides", true) {
                     self.refresh_both();
                     ui.close();
@@ -1077,6 +1168,37 @@ impl App {
             }
             if icons::icon_button(ui, Icon::Stop, "Cancel all transfers").clicked() {
                 self.each_transfers(Transfers::cancel_all);
+            }
+            ui.separator();
+            let toggle = |ui: &mut Ui, icon: Icon, on: bool, tip: &str| {
+                ui.add(
+                    egui::Button::image(icon.mono(Color32::WHITE))
+                        .selected(on)
+                        .frame_when_inactive(false)
+                        .image_tint_follows_text_color(true)
+                        .min_size(egui::vec2(26.0, 26.0)),
+                )
+                .on_hover_text(tip)
+                .clicked()
+            };
+            if icons::icon_button(ui, Icon::Search, "Find files by name (Ctrl+F)").clicked() {
+                self.open_search();
+            }
+            if toggle(
+                ui,
+                Icon::Compare,
+                self.settings.compare,
+                "Directory comparison: colors what's only on one side, newer, or of another size",
+            ) {
+                self.settings.compare = !self.settings.compare;
+            }
+            if toggle(
+                ui,
+                Icon::Sync,
+                self.tab.sync,
+                "Synchronized browsing: going into a directory on one side does on the other too",
+            ) {
+                self.toggle_sync();
             }
             ui.separator();
             ui.add_enabled_ui(self.tab.state != ConnState::Idle, |ui| {
@@ -2276,8 +2398,14 @@ impl App {
         }
     }
 
-    fn keys(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.dialog.is_some() {
+    /// The keys of the pane in focus. `typing`: a text field had the keys
+    /// as the frame began (its Enter isn't the pane's).
+    fn keys(&mut self, ctx: &egui::Context, typing: bool) {
+        if typing
+            || ctx.egui_wants_keyboard_input()
+            || self.dialog.is_some()
+            || self.site_manager.is_some()
+        {
             return;
         }
         let pane = match self.tab.focus {
@@ -2302,6 +2430,14 @@ impl App {
         });
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
             pane.select_all();
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+            self.open_search();
+            return;
+        }
+        let enabled = pane.side == Side::Local || self.tab.state == ConnState::Connected;
+        if enabled {
+            actions.extend(pane.keys(ctx));
         }
         let connected = self.tab.state == ConnState::Connected;
         for action in actions {
@@ -2346,6 +2482,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let typing = ctx.egui_wants_keyboard_input();
         self.poll_background(&ctx);
         self.poll_session(&ctx);
         self.poll_transfers();
@@ -2407,6 +2544,9 @@ impl eframe::App for App {
             )
             .show_separator_line(false)
             .show(ui, |ui| self.tab_bar(ui));
+        self.update_marks();
+        self.tab.local.focused = self.tab.focus == Side::Local;
+        self.tab.remote.focused = self.tab.focus == Side::Remote;
         let width = ui.available_width();
         let pane_frame =
             egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::same(8));
@@ -2437,8 +2577,9 @@ impl eframe::App for App {
         }
 
         self.tab_keys(&ctx);
-        self.keys(&ctx);
+        self.keys(&ctx, typing);
         self.site_manager_ui(&ctx);
+        self.search_ui(&ctx);
         self.touch_overlay(&ctx);
         self.dialogs(&ctx);
     }
@@ -2733,6 +2874,8 @@ mod tests {
     }
 }
 
+#[path = "search.rs"]
+mod search;
 #[path = "tabs.rs"]
 mod tabs;
 
