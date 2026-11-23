@@ -79,7 +79,7 @@ impl SiteManager {
             };
             let keep = match site.logon {
                 Logon::Normal | Logon::KeyFile => secret.as_str(),
-                Logon::AskPassword | Logon::Agent | Logon::Anonymous => "",
+                Logon::AskPassword | Logon::Agent | Logon::Anonymous | Logon::AwsProfile => "",
             };
             if let Err(e) = secrets::store(&site.id, keep) {
                 problem = Some(e);
@@ -346,16 +346,21 @@ impl SiteManager {
 
                 if site.protocol == Protocol::S3 {
                     ui.label("Region:");
+                    let hint = if site.logon == Logon::AwsProfile {
+                        "the profile's, or us-east-1"
+                    } else {
+                        "us-east-1"
+                    };
                     ui.add(
                         egui::TextEdit::singleline(&mut site.region)
-                            .hint_text("us-east-1")
+                            .hint_text(hint)
                             .desired_width(220.0),
                     );
                     ui.end_row();
                 }
 
                 let s3 = site.protocol == Protocol::S3;
-                if site.logon != Logon::Anonymous {
+                if !matches!(site.logon, Logon::Anonymous | Logon::AwsProfile) {
                     ui.label(if s3 { "Access key ID:" } else { "User:" });
                     ui.add(egui::TextEdit::singleline(&mut site.user).desired_width(220.0));
                     ui.end_row();
@@ -441,6 +446,22 @@ impl SiteManager {
                         ui.weak(
                             "Uses the keys of the SSH agent (ssh-agent, Pageant); security keys \
                              in it sign there.",
+                        );
+                        ui.end_row();
+                    }
+                    Logon::AwsProfile => {
+                        ui.label("Profile:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut site.aws_profile)
+                                .hint_text("default")
+                                .desired_width(220.0),
+                        );
+                        ui.end_row();
+                        ui.label("");
+                        ui.weak(
+                            "The keys, session token and region of this profile in \
+                             ~/.aws/credentials and ~/.aws/config; \"env\" takes \
+                             AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN.",
                         );
                         ui.end_row();
                     }

@@ -5414,6 +5414,7 @@ name = "rustzilla-remote"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "async-trait",
  "dav-server",
  "hidapi",
  "http-body-util",

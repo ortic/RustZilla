@@ -13,6 +13,7 @@ test-server = [
     "dep:rcgen",
     "dep:dav-server",
     "dep:s3s",
+    "dep:async-trait",
     "dep:s3s-fs",
     "dep:hyper",
     "dep:hyper-util",
@@ -28,6 +29,7 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 dav-server = { version = "0.12", default-features = false, features = ["localfs"], optional = true }
 s3s = { version = "0.17", optional = true }
 s3s-fs = { version = "0.17", default-features = false, optional = true }
+async-trait = { version = "0.1", optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"], optional = true }
 http-body-util = { version = "0.1", optional = true }

@@ -27,9 +27,11 @@ Protocols: **SFTP**, **FTP**, **FTPS** (explicit and implicit TLS),
 - **WebDAV** (Nextcloud, ownCloud, Apache, IIS, NAS boxes): PROPFIND
   listings, resumed downloads (ranges), uploads that keep file times on
   Nextcloud/ownCloud, MKCOL, MOVE, DELETE.
-- **S3**: buckets at the root, folders as prefixes, Signature V4 signing,
-  resumed downloads, uploads up to 5 GiB, copy-and-delete renames, the
-  bucket's region found by itself.
+- **S3**: buckets at the root, folders as prefixes, Signature V4 signing
+  (with session tokens), virtual-hosted addressing on AWS and path-style
+  elsewhere, resumed downloads, multipart uploads of files over 16 MiB (up
+  to 5 TiB) that resume after a cancel, copy-and-delete renames, the
+  bucket's region found by itself, keys from AWS profiles.
 - **FileZilla's layout**: Quickconnect bar, message log, local and remote
   panes side by side, transfer queue with queued, failed and successful
   transfers, status bar.
@@ -91,7 +93,19 @@ access, which the udev rules of `libfido2` (package `libfido2-1` or
 - **Site Manager** (File → Site Manager): for key files and security keys
   choose the logon type *Key file / security key* and pick the key file
   (e.g. `~/.ssh/id_ed25519_sk`). The passphrase field is for encrypted key
-  files; a security key's PIN is asked for when it's needed.
+  files; a security key's PIN is asked for when it's needed. For S3 the
+  logon type *AWS profile* takes the keys, session token and region of a
+  profile in `~/.aws/credentials` and `~/.aws/config` (or the files that
+  `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` name); the profile
+  `env` takes `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_SESSION_TOKEN` and `AWS_REGION`. Profiles with `role_arn`, SSO or
+  `credential_process` aren't supported.
+- **S3 uploads** over 16 MiB go up in parts. A cancelled one stays on the
+  server as an unfinished multipart upload: the file then shows as
+  existing with the size of its finished parts, and *Resume* carries on
+  from there, *Overwrite* starts again and drops the old parts. A
+  lifecycle rule that aborts incomplete multipart uploads cleans up the
+  ones never resumed.
 - Keys: F5 refresh, Backspace parent directory, Delete, F2 rename, Ctrl+A
   select all, on the pane last clicked.
 

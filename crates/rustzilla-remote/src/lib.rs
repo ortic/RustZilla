@@ -8,6 +8,7 @@
 //! [`Sftp`] session is a channel of the connection, so browsing and
 //! transfers share one login (and one touch of a security key).
 
+mod aws;
 mod error;
 pub mod fido;
 mod ftp;

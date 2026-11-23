@@ -6,6 +6,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **S3 multipart uploads** for files over 16 MiB, up to 5 TiB, that
+  **resume** after a cancel or a dropped connection from the parts already
+  up; failed ones are aborted.
+- **S3 session tokens** (temporary credentials), and the logon type
+  **AWS profile**: keys, token and region from `~/.aws/credentials` and
+  `~/.aws/config`, or from the `AWS_*` environment variables with the
+  profile `env`.
+
+### Changed
+
+- S3 on AWS uses **virtual-hosted addressing** (`bucket.s3.amazonaws.com`)
+  for DNS-compatible bucket names; other stores stay path-style.
+
 ## [0.1.0] - 2026-11-23
 
 The first release: a FileZilla-like file transfer client on DbCraft's stack.
