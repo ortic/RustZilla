@@ -422,6 +422,8 @@ impl App {
                 region,
                 access_key: username,
                 secret_key: password,
+                session_token: None,
+                profile: None,
             }),
         }
     }
@@ -490,7 +492,9 @@ impl App {
         let secret = secret.or_else(|| crate::secrets::load(&site.id));
         let auth = match site.logon {
             Logon::Normal => Auth::Password(secret.unwrap_or_default()),
-            Logon::AskPassword | Logon::Anonymous => Auth::Password(String::new()),
+            Logon::AskPassword | Logon::Anonymous | Logon::AwsProfile => {
+                Auth::Password(String::new())
+            }
             Logon::KeyFile => Auth::KeyFile {
                 path: site_manager::expand_home(&site.key_file),
                 passphrase: secret.unwrap_or_default(),
@@ -523,6 +527,10 @@ impl App {
                     return;
                 }
             }
+        }
+        // S3's keys from an AWS profile, read when connecting.
+        if let (Logon::AwsProfile, Params::S3(s3)) = (site.logon, &mut attempt.params) {
+            s3.profile = Some(site.aws_profile.trim().to_owned());
         }
         if site.logon == Logon::AskPassword {
             self.dialog = Some(Dialog::Secret {

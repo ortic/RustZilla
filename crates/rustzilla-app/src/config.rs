@@ -152,6 +152,9 @@ pub enum Logon {
     Agent,
     /// Anonymous FTP.
     Anonymous,
+    /// S3 keys from an AWS profile (`~/.aws/credentials`, `~/.aws/config`;
+    /// `env` for the `AWS_*` environment variables).
+    AwsProfile,
 }
 
 impl Logon {
@@ -167,7 +170,7 @@ impl Logon {
             Protocol::Ftp | Protocol::WebDav => {
                 &[Logon::Anonymous, Logon::Normal, Logon::AskPassword]
             }
-            Protocol::S3 => &[Logon::Normal, Logon::AskPassword],
+            Protocol::S3 => &[Logon::Normal, Logon::AskPassword, Logon::AwsProfile],
         }
     }
 
@@ -178,6 +181,7 @@ impl Logon {
             Logon::KeyFile => "Key file / security key",
             Logon::Agent => "SSH agent",
             Logon::Anonymous => "Anonymous",
+            Logon::AwsProfile => "AWS profile",
         }
     }
 }
@@ -239,6 +243,8 @@ pub struct Site {
     pub region: String,
     /// WebDAV's kind of server (Nextcloud, ownCloud).
     pub preset: DavPreset,
+    /// The AWS profile of S3's [`Logon::AwsProfile`].
+    pub aws_profile: String,
     /// Opened on the local side after connecting, if set.
     pub local_dir: String,
     /// SFTP through this jump host, `[user@]host[:port]` as `ssh -J`;
@@ -261,6 +267,7 @@ impl Default for Site {
             remote_dir: String::new(),
             region: String::new(),
             preset: DavPreset::Generic,
+            aws_profile: "default".into(),
             local_dir: String::new(),
             jump_host: String::new(),
         }
@@ -384,5 +391,20 @@ mod tests {
         .unwrap();
         assert_eq!(file.sites[0].host, "example.com");
         assert_eq!(file.sites[0].jump_host, "");
+    }
+
+    /// Sites saved before a field existed still load, with its default.
+    #[test]
+    fn old_s3_sites_load() {
+        let file: SitesFile = toml::from_str(
+            "[[site]]\nid = \"site-1\"\nname = \"old\"\nprotocol = \"s3\"\nlogon = \"normal\"\n",
+        )
+        .unwrap();
+        assert_eq!(file.sites[0].aws_profile, "default");
+        assert_eq!(file.sites[0].protocol, Protocol::S3);
+        let profile: SitesFile =
+            toml::from_str("[[site]]\nlogon = \"aws-profile\"\naws_profile = \"dev\"\n").unwrap();
+        assert_eq!(profile.sites[0].logon, Logon::AwsProfile);
+        assert_eq!(profile.sites[0].aws_profile, "dev");
     }
 }

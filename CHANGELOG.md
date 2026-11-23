@@ -8,6 +8,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Tabs**: a connection each, with its own sides and transfers; the queue
+  shows every tab's (Ctrl+T, Ctrl+W, Ctrl+Tab).
+- **View/Edit**: a remote file opens in the system's app for it and is
+  uploaded again, when you say so, after it's saved.
+- **Import sites** from FileZilla's Site Manager (folders, passwords stored
+  in base64, key files, remote directories) and from `~/.ssh/config`
+  (with `ProxyJump` as the jump host).
+- **Bookmarks** of a local and a remote directory, for every connection or
+  one site.
+- **Directory comparison** colors what's only on one side, newer, or of
+  another size; **synchronized browsing** follows into directories on the
+  other side.
+- **Find files**: searches a directory tree by name (`*.log`, a part of the
+  name) on this computer or the server, and transfers what it finds.
+- **Keyboard navigation** in the file lists: arrows, Page Up/Down,
+  Home/End, Shift to extend the selection, Enter, and typing a name.
+- **The queue is kept**: what's unfinished at exit is queued again at the
+  next start and runs when you connect to its server. Failed transfers can
+  all be retried at once.
+- **Speed limits** for downloads and uploads.
 - **Two-factor SSH logins**: keyboard-interactive (PAM, one-time codes).
   RustZilla answers the "Password:" prompt with the password and asks for
   the rest, e.g. a verification code, also after a key as the first factor.
@@ -24,11 +44,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   HTTPS and their WebDAV folder (Nextcloud's follows the user name).
 - Quickconnect takes a pasted WebDAV URL, such as the one Nextcloud shows
   (`https://cloud.example.com/remote.php/dav/files/alice/`).
+- **S3 multipart uploads** for files over 16 MiB, up to 5 TiB, that
+  **resume** after a cancel or a dropped connection from the parts already
+  up; failed ones are aborted.
+- **S3 session tokens** (temporary credentials), and the logon type
+  **AWS profile**: keys, token and region from `~/.aws/credentials` and
+  `~/.aws/config`, or from the `AWS_*` environment variables with the
+  profile `env`.
 
 ### Changed
 
 - WebDAV over plain HTTP sends the password with Basic only when the server
   asks for Basic.
+- S3 on AWS uses **virtual-hosted addressing** (`bucket.s3.amazonaws.com`)
+  for DNS-compatible bucket names; other stores stay path-style.
 
 ## [0.1.0] - 2026-11-23
 

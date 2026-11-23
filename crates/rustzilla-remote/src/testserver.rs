@@ -958,15 +958,182 @@ fn check_digest<B>(
     )
 }
 
+/// The part size of S3 multipart uploads in this process instead of
+/// 16 MiB, for tests with small files (S3 wants at least 5 MiB).
+pub fn set_s3_part_size(bytes: u64) {
+    crate::s3::TEST_PART_SIZE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// s3s-fs, with the ListMultipartUploads it lacks, and the parts it was
+/// sent counted.
+struct S3Fs {
+    fs: s3s_fs::FileSystem,
+    /// Unfinished uploads: (bucket, key, upload ID, when).
+    uploads: std::sync::Mutex<Vec<(String, String, String, std::time::SystemTime)>>,
+    parts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Forwards the operations the client uses to s3s-fs (`async_trait`
+/// expands after the macro, so it sees them as written out).
+macro_rules! s3_fs {
+    ($($name:ident: $input:ident => $output:ident,)*) => {
+        #[async_trait::async_trait]
+        impl s3s::S3 for S3Fs {
+            $(
+                async fn $name(
+                    &self,
+                    req: s3s::S3Request<s3s::dto::$input>,
+                ) -> s3s::S3Result<s3s::S3Response<s3s::dto::$output>> {
+                    self.fs.$name(req).await
+                }
+            )*
+
+            async fn create_multipart_upload(
+                &self,
+                req: s3s::S3Request<s3s::dto::CreateMultipartUploadInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CreateMultipartUploadOutput>> {
+                let (bucket, key) = (req.input.bucket.clone(), req.input.key.clone());
+                let response = self.fs.create_multipart_upload(req).await?;
+                if let Some(id) = &response.output.upload_id {
+                    self.uploads.lock().expect("uploads").push((
+                        bucket,
+                        key,
+                        id.clone(),
+                        std::time::SystemTime::now(),
+                    ));
+                }
+                Ok(response)
+            }
+
+            async fn upload_part(
+                &self,
+                req: s3s::S3Request<s3s::dto::UploadPartInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
+                let response = self.fs.upload_part(req).await?;
+                self.parts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(response)
+            }
+
+            async fn complete_multipart_upload(
+                &self,
+                req: s3s::S3Request<s3s::dto::CompleteMultipartUploadInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
+                let id = req.input.upload_id.clone();
+                let response = self.fs.complete_multipart_upload(req).await?;
+                self.uploads.lock().expect("uploads").retain(|u| u.2 != id);
+                Ok(response)
+            }
+
+            async fn abort_multipart_upload(
+                &self,
+                req: s3s::S3Request<s3s::dto::AbortMultipartUploadInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::AbortMultipartUploadOutput>> {
+                let id = req.input.upload_id.clone();
+                let response = self.fs.abort_multipart_upload(req).await?;
+                self.uploads.lock().expect("uploads").retain(|u| u.2 != id);
+                Ok(response)
+            }
+
+            async fn list_multipart_uploads(
+                &self,
+                req: s3s::S3Request<s3s::dto::ListMultipartUploadsInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListMultipartUploadsOutput>> {
+                let input = req.input;
+                let prefix = input.prefix.clone().unwrap_or_default();
+                let uploads = self
+                    .uploads
+                    .lock()
+                    .expect("uploads")
+                    .iter()
+                    .filter(|u| u.0 == input.bucket && u.1.starts_with(&prefix))
+                    .map(|(_, key, id, when)| s3s::dto::MultipartUpload {
+                        key: Some(key.clone()),
+                        upload_id: Some(id.clone()),
+                        initiated: Some(s3s::dto::Timestamp::from(*when)),
+                        ..Default::default()
+                    })
+                    .collect();
+                Ok(s3s::S3Response::new(s3s::dto::ListMultipartUploadsOutput {
+                    bucket: Some(input.bucket),
+                    prefix: input.prefix,
+                    uploads: Some(uploads),
+                    is_truncated: Some(false),
+                    ..Default::default()
+                }))
+            }
+        }
+    };
+}
+
+s3_fs! {
+    list_buckets: ListBucketsInput => ListBucketsOutput,
+    create_bucket: CreateBucketInput => CreateBucketOutput,
+    delete_bucket: DeleteBucketInput => DeleteBucketOutput,
+    head_bucket: HeadBucketInput => HeadBucketOutput,
+    get_bucket_location: GetBucketLocationInput => GetBucketLocationOutput,
+    list_objects: ListObjectsInput => ListObjectsOutput,
+    list_objects_v2: ListObjectsV2Input => ListObjectsV2Output,
+    head_object: HeadObjectInput => HeadObjectOutput,
+    get_object: GetObjectInput => GetObjectOutput,
+    put_object: PutObjectInput => PutObjectOutput,
+    copy_object: CopyObjectInput => CopyObjectOutput,
+    delete_object: DeleteObjectInput => DeleteObjectOutput,
+    delete_objects: DeleteObjectsInput => DeleteObjectsOutput,
+    list_parts: ListPartsInput => ListPartsOutput,
+    upload_part_copy: UploadPartCopyInput => UploadPartCopyOutput,
+}
+
+/// Signed requests only; with a session token, only those that sign it.
+struct S3Token(Option<String>);
+
+#[async_trait::async_trait]
+impl s3s::access::S3Access for S3Token {
+    async fn check(&self, cx: &mut s3s::access::S3AccessContext<'_>) -> s3s::S3Result<()> {
+        if cx.credentials().is_none() {
+            return Err(s3s::s3_error!(AccessDenied, "anonymous request"));
+        }
+        let Some(token) = &self.0 else {
+            return Ok(());
+        };
+        let header = |name: &str| {
+            cx.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+        };
+        let signed = header("authorization")
+            .split("SignedHeaders=")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .is_some_and(|names| names.split(';').any(|n| n == "x-amz-security-token"));
+        if header("x-amz-security-token") == token && signed {
+            Ok(())
+        } else {
+            Err(s3s::s3_error!(
+                InvalidToken,
+                "the session token is missing, wrong or not signed"
+            ))
+        }
+    }
+}
+
 /// An S3 server in the process (s3s-fs): buckets are the directories of
 /// `root`; the keys are `AKTEST`/`SECRETTEST`.
 pub struct S3TestServer {
     pub port: u16,
+    session_token: Option<String>,
+    parts: Arc<std::sync::atomic::AtomicUsize>,
     _runtime: Runtime,
 }
 
 impl S3TestServer {
     pub fn start(root: &Path) -> Self {
+        Self::start_with_token(root, None)
+    }
+
+    /// A server that wants the session token `token` with each request,
+    /// signed.
+    pub fn start_with_token(root: &Path, token: Option<&str>) -> Self {
         use hyper_util::rt::{TokioExecutor, TokioIo};
         use hyper_util::server::conn::auto::Builder;
         fs::create_dir_all(root).expect("creating the server's directory");
@@ -975,9 +1142,15 @@ impl S3TestServer {
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .expect("a port");
         let port = listener.local_addr().expect("its address").port();
-        let fs = s3s_fs::FileSystem::new(root).expect("the served directory");
+        let parts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fs = S3Fs {
+            fs: s3s_fs::FileSystem::new(root).expect("the served directory"),
+            uploads: std::sync::Mutex::new(Vec::new()),
+            parts: parts.clone(),
+        };
         let mut builder = s3s::service::S3ServiceBuilder::new(fs);
         builder.set_auth(s3s::auth::SimpleAuth::from_single("AKTEST", "SECRETTEST"));
+        builder.set_access(S3Token(token.map(str::to_owned)));
         let service = builder.build();
         runtime.spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -991,8 +1164,15 @@ impl S3TestServer {
         });
         Self {
             port,
+            session_token: token.map(str::to_owned),
+            parts,
             _runtime: runtime,
         }
+    }
+
+    /// How many parts of multipart uploads it took.
+    pub fn parts_uploaded(&self) -> usize {
+        self.parts.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn params(&self) -> crate::S3Params {
@@ -1003,6 +1183,8 @@ impl S3TestServer {
             region: "us-east-1".into(),
             access_key: "AKTEST".into(),
             secret_key: "SECRETTEST".into(),
+            session_token: self.session_token.clone(),
+            profile: None,
         }
     }
 }
