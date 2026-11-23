@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use rustzilla_remote::{FtpEncryption, Protocol};
 use serde::{Deserialize, Serialize};
 
+use crate::transfers::NewItem;
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub config_dir: PathBuf,
@@ -39,6 +41,54 @@ impl Paths {
     fn sites_file(&self) -> PathBuf {
         self.config_dir.join("sites.toml")
     }
+
+    /// The transfers left at the end of the last run.
+    fn queue_file(&self) -> PathBuf {
+        self.data_dir.join("queue.toml")
+    }
+}
+
+/// A transfer kept for the next run, with the server it's for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTransfer {
+    pub server: String,
+    #[serde(flatten)]
+    pub item: NewItem,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct QueueFile {
+    #[serde(default, rename = "transfer")]
+    transfers: Vec<SavedTransfer>,
+}
+
+pub fn load_queue(paths: &Paths) -> Result<Vec<SavedTransfer>, String> {
+    let file = paths.queue_file();
+    let text = match fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("reading {}: {e}", file.display())),
+    };
+    toml::from_str::<QueueFile>(&text)
+        .map(|f| f.transfers)
+        .map_err(|e| format!("reading {}: {e}", file.display()))
+}
+
+/// Keeps `transfers` for the next run; none: removes the file.
+pub fn save_queue(paths: &Paths, transfers: Vec<SavedTransfer>) -> Result<(), String> {
+    let file = paths.queue_file();
+    if transfers.is_empty() {
+        return match fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(format!("removing {}: {e}", file.display()))
+            }
+            _ => Ok(()),
+        };
+    }
+    let text = toml::to_string_pretty(&QueueFile { transfers }).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&paths.data_dir)
+        .and_then(|()| fs::write(&file, text))
+        .map_err(|e| format!("saving {}: {e}", file.display()))
 }
 
 /// How a site logs in, as FileZilla's logon types.
@@ -190,6 +240,22 @@ mod tests {
         ];
         save_sites(&paths, &sites).unwrap();
         assert_eq!(load_sites(&paths).unwrap(), sites);
+
+        assert!(load_queue(&paths).unwrap().is_empty());
+        let queue = vec![SavedTransfer {
+            server: "ftp://example.com".into(),
+            item: NewItem {
+                direction: crate::transfers::Direction::Upload,
+                local: dir.join("a b.txt"),
+                remote: "/up/a b.txt".into(),
+                is_dir: false,
+                size: 12,
+            },
+        }];
+        save_queue(&paths, queue.clone()).unwrap();
+        assert_eq!(load_queue(&paths).unwrap(), queue);
+        save_queue(&paths, Vec::new()).unwrap();
+        assert!(load_queue(&paths).unwrap().is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 }

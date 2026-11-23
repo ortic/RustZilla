@@ -40,6 +40,9 @@ struct Settings {
     quick_user: String,
     quick_port: String,
     theme: ThemePref,
+    /// Speed limits in KiB/s; 0 for none.
+    limit_down: u64,
+    limit_up: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -71,6 +74,8 @@ impl Default for Settings {
             quick_user: String::new(),
             quick_port: String::new(),
             theme: ThemePref::System,
+            limit_down: 0,
+            limit_up: 0,
         }
     }
 }
@@ -155,13 +160,9 @@ enum QueueTab {
     Done,
 }
 
-pub struct App {
-    ctx: egui::Context,
-    paths: Option<Paths>,
-    sites: Vec<Site>,
-    settings: Settings,
-    quick_password: String,
-    log: Vec<LogLine>,
+/// One connection's side of the window: its panes, its session and its
+/// transfers. The window shows one tab at a time; the others go on.
+pub struct Tab {
     local: Pane,
     remote: Pane,
     session: Option<Session>,
@@ -169,18 +170,66 @@ pub struct App {
     state: ConnState,
     attempt: Option<Attempt>,
     transfers: Transfers,
-    dialog: Option<Dialog>,
-    site_manager: Option<SiteManager>,
     /// The pane keys act on.
     focus: Side,
-    queue_tab: QueueTab,
-    /// The exists dialog's choice.
-    exists_choice: Exists,
-    exists_all: bool,
     /// The server's home directory, for the Home button.
     remote_home: String,
     /// Whether the connection logged in with a security key.
     security_key_login: bool,
+    /// The saved site connected to, for its bookmarks.
+    site: Option<Site>,
+}
+
+impl Tab {
+    fn new(exists: Exists) -> Self {
+        let mut remote = Pane::new(Side::Remote);
+        remote.clear("Not connected to any server");
+        Self {
+            local: Pane::new(Side::Local),
+            remote,
+            session: None,
+            connection: None,
+            state: ConnState::Idle,
+            attempt: None,
+            transfers: Transfers::new(exists),
+            focus: Side::Local,
+            remote_home: String::new(),
+            security_key_login: false,
+            site: None,
+        }
+    }
+
+    /// What the tab is called: the site, the server, or "New tab".
+    fn title(&self) -> String {
+        if let Some(site) = &self.site {
+            return site.name.clone();
+        }
+        match (&self.connection, &self.attempt) {
+            (Some(c), _) => c.name().to_owned(),
+            (None, Some(a)) => a.params.host().to_owned(),
+            _ => "New tab".to_owned(),
+        }
+    }
+}
+
+pub struct App {
+    ctx: egui::Context,
+    paths: Option<Paths>,
+    sites: Vec<Site>,
+    settings: Settings,
+    quick_password: String,
+    log: Vec<LogLine>,
+    /// The tab shown.
+    tab: Tab,
+    /// All tabs, in order; at `active` a stand-in while `tab` is out.
+    tabs: Vec<Tab>,
+    active: usize,
+    dialog: Option<Dialog>,
+    site_manager: Option<SiteManager>,
+    queue_tab: QueueTab,
+    /// The exists dialog's choice.
+    exists_choice: Exists,
+    exists_all: bool,
 }
 
 impl App {
@@ -201,24 +250,17 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             paths,
             sites,
-            transfers: Transfers::new(settings.exists),
+            tab: Tab::new(settings.exists),
+            tabs: vec![Tab::new(settings.exists)],
+            active: 0,
             settings,
             quick_password: String::new(),
             log: Vec::new(),
-            local: Pane::new(Side::Local),
-            remote: Pane::new(Side::Remote),
-            session: None,
-            connection: None,
-            state: ConnState::Idle,
-            attempt: None,
             dialog: None,
             site_manager: None,
-            focus: Side::Local,
             queue_tab: QueueTab::Queued,
             exists_choice: Exists::Overwrite,
             exists_all: false,
-            remote_home: String::new(),
-            security_key_login: false,
         };
         icons::install(&cc.egui_ctx);
         theme::install(&cc.egui_ctx);
@@ -227,11 +269,36 @@ impl App {
             .filter(|p| p.is_dir())
             .unwrap_or_else(local::home);
         app.list_local(&start);
-        app.remote.clear("Not connected to any server");
+        app.apply_limits();
+        // What the last run left in the queue waits for its server.
+        if let Some(paths) = &app.paths {
+            match config::load_queue(paths) {
+                Ok(saved) if !saved.is_empty() => {
+                    let n = saved.len();
+                    for transfer in saved {
+                        app.tab.transfers.add(&transfer.server, vec![transfer.item]);
+                    }
+                    app.log(
+                        LogKind::Status,
+                        format!(
+                            "{n} transfers are left from the last time; they start when you \
+                             connect to their server"
+                        ),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => problems.push(e),
+            }
+        }
         for problem in problems {
             app.log(LogKind::Error, problem);
         }
         app
+    }
+
+    fn apply_limits(&self) {
+        crate::transfers::set_limit(Direction::Download, self.settings.limit_down * 1024);
+        crate::transfers::set_limit(Direction::Upload, self.settings.limit_up * 1024);
     }
 
     fn log(&mut self, kind: LogKind, text: String) {
@@ -265,7 +332,7 @@ impl App {
     }
 
     fn server(&self) -> Option<String> {
-        self.connection.as_ref().map(|c| c.name().to_owned())
+        self.tab.connection.as_ref().map(|c| c.name().to_owned())
     }
 
     /// The parameters of a login, by protocol.
@@ -330,6 +397,11 @@ impl App {
             self.dialog = Some(Dialog::Message("Enter the server to connect to.".into()));
             return;
         };
+        // A tab with a connection keeps it: the new one gets a tab.
+        if self.busy() {
+            self.new_tab();
+        }
+        self.tab.site = None;
         let user = target
             .user
             .clone()
@@ -370,6 +442,10 @@ impl App {
     }
 
     fn connect_site(&mut self, ctx: &egui::Context, site: &Site, secret: Option<String>) {
+        if self.busy() {
+            self.new_tab();
+        }
+        self.tab.site = Some(site.clone());
         if !site.local_dir.trim().is_empty() {
             let dir = site_manager::expand_home(&site.local_dir);
             self.list_local(&dir);
@@ -430,37 +506,39 @@ impl App {
                 ),
             );
         }
-        self.state = ConnState::Connecting { touch: false };
-        self.remote.clear("Connecting...");
-        self.remote.busy = true;
-        self.session = Some(Session::start(
+        self.tab.state = ConnState::Connecting { touch: false };
+        self.tab.remote.clear("Connecting...");
+        self.tab.remote.busy = true;
+        self.tab.session = Some(Session::start(
             attempt.params.clone(),
             attempt.remote_dir.clone(),
             ctx.clone(),
         ));
-        self.attempt = Some(attempt);
+        self.tab.attempt = Some(attempt);
     }
 
     fn disconnect(&mut self) {
-        if let Some(session) = self.session.take() {
+        if let Some(session) = self.tab.session.take() {
             session.send(Command::Disconnect);
         }
-        self.transfers.stop();
-        self.connection = None;
-        if self.state != ConnState::Idle {
-            self.state = ConnState::Idle;
-            self.remote.clear("Not connected to any server");
+        self.tab.transfers.stop();
+        self.tab.connection = None;
+        if self.tab.state != ConnState::Idle {
+            self.tab.state = ConnState::Idle;
+            self.tab.remote.clear("Not connected to any server");
         }
     }
 
     fn poll_session(&mut self, ctx: &egui::Context) {
-        let Some(session) = &self.session else { return };
+        let Some(session) = &self.tab.session else {
+            return;
+        };
         let events: Vec<Event> = session.rx.try_iter().collect();
         for event in events {
             match event {
                 Event::Log(kind, text) => self.log(kind, text),
                 Event::Touch => {
-                    self.state = ConnState::Connecting { touch: true };
+                    self.tab.state = ConnState::Connecting { touch: true };
                     self.log(LogKind::Status, "Touch your security key".into());
                 }
                 Event::Connected { connection, home } => {
@@ -468,22 +546,40 @@ impl App {
                         LogKind::Status,
                         format!("Connected to {}, home directory {home}", connection.name()),
                     );
-                    self.transfers
-                        .start(connection.clone(), self.settings.parallel, ctx.clone());
-                    self.connection = Some(connection);
-                    self.state = ConnState::Connected;
-                    self.remote_home = home;
-                    self.security_key_login = matches!(
-                        self.attempt.as_ref().map(|a| &a.params),
+                    self.tab.transfers.start(
+                        connection.clone(),
+                        self.settings.parallel,
+                        ctx.clone(),
+                    );
+                    // Transfers for this server waiting in other tabs (or
+                    // left from the last run) run here.
+                    let name = connection.name().to_owned();
+                    let mut moved = Vec::new();
+                    for index in (0..self.tabs.len()).filter(|&i| i != self.active) {
+                        let other = self.tab_at(index);
+                        let served = other.state == ConnState::Connected
+                            && other.connection.as_ref().is_some_and(|c| c.name() == name);
+                        if !served {
+                            moved.extend(other.transfers.take_waiting(&name));
+                        }
+                    }
+                    if !moved.is_empty() {
+                        self.tab.transfers.add(&name, moved);
+                    }
+                    self.tab.connection = Some(connection);
+                    self.tab.state = ConnState::Connected;
+                    self.tab.remote_home = home;
+                    self.tab.security_key_login = matches!(
+                        self.tab.attempt.as_ref().map(|a| &a.params),
                         Some(Params::Sftp(SshParams { auth: Auth::KeyFile { path, .. }, .. }))
                             if rustzilla_remote::is_security_key(path)
                     );
                 }
                 Event::Failed(error) => {
-                    self.session = None;
-                    self.state = ConnState::Idle;
-                    self.remote.clear("Not connected to any server");
-                    let attempt = self.attempt.clone().map(Box::new);
+                    self.tab.session = None;
+                    self.tab.state = ConnState::Idle;
+                    self.tab.remote.clear("Not connected to any server");
+                    let attempt = self.tab.attempt.clone().map(Box::new);
                     match (error.kind.clone(), attempt) {
                         (ErrorKind::UnknownHostKey(key), Some(attempt)) => {
                             self.log(LogKind::Status, error.message.clone());
@@ -513,30 +609,30 @@ impl App {
                         }
                         _ => {
                             self.log(LogKind::Error, format!("Could not connect: {error}"));
-                            self.remote.clear(format!("Could not connect: {error}"));
+                            self.tab.remote.clear(format!("Could not connect: {error}"));
                         }
                     }
                 }
                 Event::Listing { path, entries } => {
                     let rows = entries.into_iter().map(remote_row).collect();
-                    self.remote.set_listing(path, rows);
+                    self.tab.remote.set_listing(path, rows);
                 }
                 Event::ListFailed { path } => {
-                    self.remote.busy = false;
-                    if self.remote.path.is_empty() {
+                    self.tab.remote.busy = false;
+                    if self.tab.remote.path.is_empty() {
                         // The start directory isn't there: the home one.
                         self.log(
                             LogKind::Status,
                             format!("{path} can't be listed; showing the home directory"),
                         );
-                        if let Some(session) = &self.session {
+                        if let Some(session) = &self.tab.session {
                             session.send(Command::List(".".into()));
-                            self.remote.busy = true;
+                            self.tab.remote.busy = true;
                         }
                     }
                 }
                 Event::Changed(dir) => {
-                    if dir == self.remote.path {
+                    if dir == self.tab.remote.path {
                         self.list_remote(dir);
                     }
                 }
@@ -544,27 +640,27 @@ impl App {
                     if let Some(reason) = reason {
                         self.log(LogKind::Error, format!("Disconnected: {reason}"));
                     }
-                    self.session = None;
+                    self.tab.session = None;
                     self.disconnect();
                 }
             }
         }
         // A connection that died while idle.
-        if self.state == ConnState::Connected
-            && self.connection.as_ref().is_some_and(|c| c.is_closed())
+        if self.tab.state == ConnState::Connected
+            && self.tab.connection.as_ref().is_some_and(|c| c.is_closed())
         {
             self.log(
                 LogKind::Error,
                 "The connection to the server is lost".into(),
             );
-            self.session = None;
+            self.tab.session = None;
             self.disconnect();
         }
     }
 
     fn poll_transfers(&mut self) {
         let (local, remote, log) = {
-            let mut queue = self.transfers.queue();
+            let mut queue = self.tab.transfers.queue();
             (
                 std::mem::take(&mut queue.changed_local),
                 std::mem::take(&mut queue.changed_remote),
@@ -574,12 +670,12 @@ impl App {
         for (kind, text) in log {
             self.log(kind, text);
         }
-        if local.iter().any(|d| Path::new(&self.local.path) == d) {
-            let dir = PathBuf::from(&self.local.path);
+        if local.iter().any(|d| Path::new(&self.tab.local.path) == d) {
+            let dir = PathBuf::from(&self.tab.local.path);
             self.list_local(&dir);
         }
-        if remote.contains(&self.remote.path) {
-            self.list_remote(self.remote.path.clone());
+        if remote.contains(&self.tab.remote.path) {
+            self.list_remote(self.tab.remote.path.clone());
         }
     }
 
@@ -590,7 +686,7 @@ impl App {
         match local::list(&dir) {
             Ok(rows) => {
                 self.settings.local_dir = dir.display().to_string();
-                self.local.set_listing(dir.display().to_string(), rows);
+                self.tab.local.set_listing(dir.display().to_string(), rows);
             }
             Err(e) => {
                 self.log(LogKind::Error, format!("Listing {}: {e}", dir.display()));
@@ -599,16 +695,16 @@ impl App {
     }
 
     fn list_remote(&mut self, dir: String) {
-        if let Some(session) = &self.session
-            && self.state == ConnState::Connected
+        if let Some(session) = &self.tab.session
+            && self.tab.state == ConnState::Connected
         {
-            self.remote.busy = true;
+            self.tab.remote.busy = true;
             session.send(Command::List(dir));
         }
     }
 
     fn local_action(&mut self, action: Action) {
-        let dir = PathBuf::from(&self.local.path);
+        let dir = PathBuf::from(&self.tab.local.path);
         match action {
             Action::Open(name) => self.list_local(&dir.join(name)),
             Action::Up => {
@@ -646,12 +742,12 @@ impl App {
     }
 
     fn remote_action(&mut self, action: Action) {
-        let dir = self.remote.path.clone();
+        let dir = self.tab.remote.path.clone();
         match action {
             Action::Open(name) => self.list_remote(path::join(&dir, &name)),
             Action::Up => self.list_remote(path::parent(&dir)),
             Action::Navigate(path) => self.list_remote(path),
-            Action::Home => self.list_remote(self.remote_home.clone()),
+            Action::Home => self.list_remote(self.tab.remote_home.clone()),
             Action::SiteManager => self.open_site_manager(None),
             Action::Refresh => self.list_remote(dir),
             Action::Transfer(names) => self.download(&names),
@@ -678,12 +774,12 @@ impl App {
             Action::Permissions(names) => {
                 let mode = names
                     .first()
-                    .and_then(|n| self.remote.row(n))
+                    .and_then(|n| self.tab.remote.row(n))
                     .and_then(|r| r.permissions)
                     .unwrap_or(0o644);
                 let recursive_note = names
                     .iter()
-                    .any(|n| self.remote.row(n).is_some_and(|r| r.is_dir));
+                    .any(|n| self.tab.remote.row(n).is_some_and(|r| r.is_dir));
                 self.dialog = Some(Dialog::Chmod {
                     names,
                     mode,
@@ -699,21 +795,21 @@ impl App {
             self.log(LogKind::Error, "Connect to a server to upload".into());
             return;
         };
-        let dir = PathBuf::from(&self.local.path);
+        let dir = PathBuf::from(&self.tab.local.path);
         let items = names
             .iter()
             .filter_map(|name| {
-                let row = self.local.row(name)?;
+                let row = self.tab.local.row(name)?;
                 Some(NewItem {
                     direction: Direction::Upload,
                     local: dir.join(name),
-                    remote: path::join(&self.remote.path, name),
+                    remote: path::join(&self.tab.remote.path, name),
                     is_dir: row.is_dir,
                     size: row.size,
                 })
             })
             .collect();
-        self.transfers.add(&server, items);
+        self.tab.transfers.add(&server, items);
         self.queue_tab = QueueTab::Queued;
     }
 
@@ -730,14 +826,14 @@ impl App {
                 let name = local.file_name()?.to_string_lossy().into_owned();
                 Some(NewItem {
                     direction: Direction::Upload,
-                    remote: path::join(&self.remote.path, &name),
+                    remote: path::join(&self.tab.remote.path, &name),
                     local,
                     is_dir: meta.is_dir(),
                     size: if meta.is_dir() { 0 } else { meta.len() },
                 })
             })
             .collect();
-        self.transfers.add(&server, items);
+        self.tab.transfers.add(&server, items);
     }
 
     /// Queues the remote entries `names` for download to the local
@@ -746,21 +842,21 @@ impl App {
         let Some(server) = self.server() else {
             return;
         };
-        let dir = PathBuf::from(&self.local.path);
+        let dir = PathBuf::from(&self.tab.local.path);
         let items = names
             .iter()
             .filter_map(|name| {
-                let row = self.remote.row(name)?;
+                let row = self.tab.remote.row(name)?;
                 Some(NewItem {
                     direction: Direction::Download,
                     local: dir.join(name),
-                    remote: path::join(&self.remote.path, name),
+                    remote: path::join(&self.tab.remote.path, name),
                     is_dir: row.is_dir,
                     size: row.size,
                 })
             })
             .collect();
-        self.transfers.add(&server, items);
+        self.tab.transfers.add(&server, items);
         self.queue_tab = QueueTab::Queued;
     }
 
@@ -775,8 +871,17 @@ impl App {
                     self.open_site_manager(None);
                     ui.close();
                 }
-                let connected = self.state != ConnState::Idle;
-                if icons::menu_item(ui, Icon::Reconnect, "Reconnect", self.attempt.is_some()) {
+                if icons::menu_item(ui, Icon::Plus, "New tab   Ctrl+T", true) {
+                    self.new_tab();
+                    ui.close();
+                }
+                if icons::menu_item(ui, Icon::Close, "Close tab   Ctrl+W", true) {
+                    self.close_tab(self.active);
+                    ui.close();
+                }
+                ui.separator();
+                let connected = self.tab.state != ConnState::Idle;
+                if icons::menu_item(ui, Icon::Reconnect, "Reconnect", self.tab.attempt.is_some()) {
                     self.reconnect(ctx);
                     ui.close();
                 }
@@ -799,7 +904,7 @@ impl App {
             let transfer = ui.menu_button("Transfer", |ui| {
                 ui.set_min_width(220.0);
                 ui.weak("If the target file exists:");
-                let mut policy = self.transfers.queue().policy;
+                let mut policy = self.settings.exists;
                 for option in Exists::ALL {
                     if ui
                         .radio_value(&mut policy, option, option.label())
@@ -808,16 +913,43 @@ impl App {
                         ui.close();
                     }
                 }
-                self.transfers.queue().policy = policy;
-                self.settings.exists = policy;
+                if policy != self.settings.exists {
+                    self.set_policy(policy);
+                }
                 ui.separator();
                 if icons::menu_item(ui, Icon::Stop, "Cancel all transfers", true) {
-                    self.transfers.cancel_all();
+                    self.each_transfers(Transfers::cancel_all);
                     ui.close();
                 }
                 if icons::menu_item(ui, Icon::Trash, "Clear finished transfers", true) {
-                    self.transfers.remove_finished();
+                    self.each_transfers(Transfers::remove_finished);
                     ui.close();
+                }
+                if icons::menu_item(ui, Icon::Refresh, "Retry failed transfers", true) {
+                    self.each_transfers(Transfers::retry_failed);
+                    ui.close();
+                }
+                ui.separator();
+                ui.weak("Speed limits (0: none)");
+                let before = (self.settings.limit_down, self.settings.limit_up);
+                egui::Grid::new("limits").num_columns(3).show(ui, |ui| {
+                    for (icon, label, value) in [
+                        (Icon::Download, "Downloads", &mut self.settings.limit_down),
+                        (Icon::Upload, "Uploads", &mut self.settings.limit_up),
+                    ] {
+                        ui.add(icon.sized(ui, 14.0));
+                        ui.label(label);
+                        ui.add(
+                            egui::DragValue::new(value)
+                                .range(0..=1_000_000)
+                                .speed(10)
+                                .suffix(" KiB/s"),
+                        );
+                        ui.end_row();
+                    }
+                });
+                if before != (self.settings.limit_down, self.settings.limit_up) {
+                    self.apply_limits();
                 }
             });
             menus.push(transfer.response);
@@ -880,13 +1012,13 @@ impl App {
     }
 
     fn refresh_both(&mut self) {
-        let dir = PathBuf::from(&self.local.path);
+        let dir = PathBuf::from(&self.tab.local.path);
         self.list_local(&dir);
-        self.list_remote(self.remote.path.clone());
+        self.list_remote(self.tab.remote.path.clone());
     }
 
     fn reconnect(&mut self, ctx: &egui::Context) {
-        if let Some(attempt) = self.attempt.clone() {
+        if let Some(attempt) = self.tab.attempt.clone() {
             self.connect(ctx, attempt);
         }
     }
@@ -921,7 +1053,7 @@ impl App {
                 self.connect_site(ctx, &site, None);
             }
             ui.separator();
-            let connected = self.state == ConnState::Connected;
+            let connected = self.tab.state == ConnState::Connected;
             if icons::icon_button(ui, Icon::Refresh, "Refresh both sides (F5)").clicked() {
                 self.refresh_both();
             }
@@ -944,15 +1076,15 @@ impl App {
                 self.settings.show_log = !self.settings.show_log;
             }
             if icons::icon_button(ui, Icon::Stop, "Cancel all transfers").clicked() {
-                self.transfers.cancel_all();
+                self.each_transfers(Transfers::cancel_all);
             }
             ui.separator();
-            ui.add_enabled_ui(self.state != ConnState::Idle, |ui| {
+            ui.add_enabled_ui(self.tab.state != ConnState::Idle, |ui| {
                 if icons::icon_button(ui, Icon::Disconnect, "Disconnect").clicked() {
                     self.disconnect();
                 }
             });
-            ui.add_enabled_ui(self.attempt.is_some() && !connected, |ui| {
+            ui.add_enabled_ui(self.tab.attempt.is_some() && !connected, |ui| {
                 if icons::icon_button(ui, Icon::Reconnect, "Reconnect").clicked() {
                     self.reconnect(ctx);
                 }
@@ -1044,24 +1176,50 @@ impl App {
             });
     }
 
+    /// The transfers of every tab, with the tab's index.
+    fn all_items(&self) -> Vec<(usize, Item)> {
+        (0..self.tabs.len())
+            .flat_map(|t| {
+                self.tab_at(t)
+                    .transfers
+                    .queue()
+                    .items
+                    .iter()
+                    .map(|i| (t, i.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn each_transfers(&self, f: impl Fn(&Transfers)) {
+        for t in 0..self.tabs.len() {
+            f(&self.tab_at(t).transfers);
+        }
+    }
+
+    fn set_policy(&mut self, policy: Exists) {
+        self.each_transfers(|t| t.queue().policy = policy);
+        self.settings.exists = policy;
+    }
+
     fn queue_ui(&mut self, ui: &mut Ui) {
-        let items: Vec<Item> = self.transfers.queue().items.clone();
-        let queued: Vec<&Item> = items
+        let items = self.all_items();
+        let queued: Vec<&(usize, Item)> = items
             .iter()
-            .filter(|i| matches!(i.state, State::Queued | State::Active | State::Asking(_)))
+            .filter(|(_, i)| matches!(i.state, State::Queued | State::Active | State::Asking(_)))
             .collect();
-        let failed: Vec<&Item> = items
+        let failed: Vec<&(usize, Item)> = items
             .iter()
-            .filter(|i| {
+            .filter(|(_, i)| {
                 matches!(
                     i.state,
                     State::Failed(_) | State::Cancelled | State::Skipped(_)
                 )
             })
             .collect();
-        let done: Vec<&Item> = items
+        let done: Vec<&(usize, Item)> = items
             .iter()
-            .filter(|i| i.state == State::Done && !i.is_dir)
+            .filter(|(_, i)| i.state == State::Done && !i.is_dir)
             .collect();
         ui.horizontal(|ui| {
             ui.set_min_height(28.0);
@@ -1097,11 +1255,16 @@ impl App {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.queue_tab == QueueTab::Failed
+                    && icons::icon_button(ui, Icon::Refresh, "Retry all failed transfers").clicked()
+                {
+                    self.each_transfers(Transfers::retry_failed);
+                }
                 if icons::icon_button(ui, Icon::Trash, "Clear finished transfers").clicked() {
-                    self.transfers.remove_finished();
+                    self.each_transfers(Transfers::remove_finished);
                 }
                 if icons::icon_button(ui, Icon::Stop, "Cancel all transfers").clicked() {
-                    self.transfers.cancel_all();
+                    self.each_transfers(Transfers::cancel_all);
                 }
                 ui.separator();
                 let before = self.settings.parallel;
@@ -1113,13 +1276,14 @@ impl App {
                 .on_hover_text("How many files transfer at the same time");
                 ui.label(RichText::new("Parallel").color(ui.visuals().weak_text_color()));
                 if before != self.settings.parallel
-                    && let Some(connection) = self.connection.clone()
+                    && let Some(connection) = self.tab.connection.clone()
                 {
-                    self.transfers
+                    self.tab
+                        .transfers
                         .start(connection, self.settings.parallel, ui.ctx().clone());
                 }
                 ui.separator();
-                let mut policy = self.transfers.queue().policy;
+                let mut policy = self.settings.exists;
                 egui::ComboBox::from_id_salt("exists-policy")
                     .selected_text(policy.label())
                     .width(170.0)
@@ -1128,8 +1292,9 @@ impl App {
                             ui.selectable_value(&mut policy, option, option.label());
                         }
                     });
-                self.transfers.queue().policy = policy;
-                self.settings.exists = policy;
+                if policy != self.settings.exists {
+                    self.set_policy(policy);
+                }
                 ui.label(RichText::new("If the file exists").color(ui.visuals().weak_text_color()));
             });
         });
@@ -1167,11 +1332,19 @@ impl App {
         });
     }
 
-    fn queue_table(&mut self, ui: &mut Ui, shown: &[&Item]) {
+    fn queue_table(&mut self, ui: &mut Ui, shown: &[&(usize, Item)]) {
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 10.0;
         let mut cancel = None;
         let mut retry = None;
         let mut remove = None;
+        // The servers a tab is connected to: the others' transfers wait.
+        let connected: Vec<String> = (0..self.tabs.len())
+            .filter_map(|t| {
+                let tab = self.tab_at(t);
+                let c = tab.connection.as_ref()?;
+                (tab.state == ConnState::Connected).then(|| c.name().to_owned())
+            })
+            .collect();
         TableBuilder::new(ui)
             .id_salt("queue")
             .striped(true)
@@ -1201,7 +1374,8 @@ impl App {
             })
             .body(|body| {
                 body.rows(row_height, shown.len(), |mut row| {
-                    let item = shown[row.index()];
+                    let (tab, item) = shown[row.index()];
+                    let tab = *tab;
                     row.col(|ui| {
                         let (icon, tip) = match item.direction {
                             Direction::Upload => (Icon::Upload, "Upload"),
@@ -1235,7 +1409,16 @@ impl App {
                         progress_ui(ui, item);
                     });
                     row.col(|ui| {
-                        let (icon, text, color) = status(ui, item);
+                        let (icon, text, color) =
+                            if item.state == State::Queued && !connected.contains(&item.server) {
+                                (
+                                    Some(Icon::Clock),
+                                    format!("Waiting for a connection to {}", item.server),
+                                    ui.visuals().weak_text_color(),
+                                )
+                            } else {
+                                status(ui, item)
+                            };
                         if let Some(icon) = icon {
                             ui.add(icon.sized(ui, 14.0));
                         }
@@ -1243,38 +1426,39 @@ impl App {
                     });
                     row.response().context_menu(|ui| {
                         if icons::menu_item(ui, Icon::Stop, "Cancel", !item.state.finished()) {
-                            cancel = Some(item.id);
+                            cancel = Some((tab, item.id));
                             ui.close();
                         }
                         let failed = matches!(item.state, State::Failed(_) | State::Cancelled);
                         if icons::menu_item(ui, Icon::Refresh, "Retry", failed) {
-                            retry = Some(item.id);
+                            retry = Some((tab, item.id));
                             ui.close();
                         }
                         if icons::menu_item(ui, Icon::Trash, "Remove", item.state != State::Active)
                         {
-                            remove = Some(item.id);
+                            remove = Some((tab, item.id));
                             ui.close();
                         }
                     });
                 });
             });
-        if let Some(id) = cancel {
-            self.transfers.cancel(id);
+        if let Some((tab, id)) = cancel {
+            self.tab_at(tab).transfers.cancel(id);
         }
-        if let Some(id) = retry {
-            self.transfers.retry(id);
+        if let Some((tab, id)) = retry {
+            self.tab_at(tab).transfers.retry(id);
         }
-        if let Some(id) = remove {
-            self.transfers.remove(id);
+        if let Some((tab, id)) = remove {
+            self.tab_at(tab).transfers.remove(id);
         }
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            match (&self.state, &self.connection) {
+            match (&self.tab.state, &self.tab.connection) {
                 (ConnState::Connected, Some(c)) => {
                     let protocol = self
+                        .tab
                         .attempt
                         .as_ref()
                         .map_or(Protocol::Sftp, |a| a.params.protocol());
@@ -1301,7 +1485,7 @@ impl App {
                     }
                     ui.label(format!("Connected to {}", c.name()));
                     ui.weak(kind);
-                    if self.security_key_login {
+                    if self.tab.security_key_login {
                         ui.separator();
                         ui.add(Icon::SecurityKey.sized(ui, 14.0));
                         ui.weak("Logged in with a security key");
@@ -1325,10 +1509,10 @@ impl App {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let queue = self.transfers.queue();
-                let pending: Vec<&Item> = queue
-                    .items
+                let items = self.all_items();
+                let pending: Vec<&Item> = items
                     .iter()
+                    .map(|(_, i)| i)
                     .filter(|i| !i.state.finished() && !i.is_dir)
                     .collect();
                 if pending.is_empty() {
@@ -1607,8 +1791,8 @@ impl App {
                 }
                 Dialog::Mkdir { side, name } => {
                     let place = match side {
-                        Side::Local => self.local.path.clone(),
-                        Side::Remote => self.remote.path.clone(),
+                        Side::Local => self.tab.local.path.clone(),
+                        Side::Remote => self.tab.remote.path.clone(),
                     };
                     header(ui, Icon::NewFolder, "Create directory", &format!("In {place}"));
                     ui.add(
@@ -1677,8 +1861,8 @@ impl App {
                             ui.set_width(ui.available_width());
                             egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
                                 let pane = match side {
-                                    Side::Local => &self.local,
-                                    Side::Remote => &self.remote,
+                                    Side::Local => &self.tab.local,
+                                    Side::Remote => &self.tab.remote,
                                 };
                                 for name in names.iter() {
                                     ui.horizontal(|ui| {
@@ -1842,24 +2026,17 @@ impl App {
 
     /// Asks what to do about the first transfer whose target exists.
     fn exists_dialog(&mut self, ctx: &egui::Context) {
-        let asking = self
-            .transfers
-            .queue()
-            .items
-            .iter()
-            .find_map(|i| match &i.state {
-                State::Asking(conflict) => Some((i.clone(), conflict.clone())),
-                _ => None,
-            });
-        let Some((item, conflict)) = asking else {
+        let items = self.all_items();
+        let asking = items.iter().find_map(|(t, i)| match &i.state {
+            State::Asking(conflict) => Some((*t, i.clone(), conflict.clone())),
+            _ => None,
+        });
+        let Some((tab, item, conflict)) = asking else {
             return;
         };
-        let waiting = self
-            .transfers
-            .queue()
-            .items
+        let waiting = items
             .iter()
-            .filter(|i| matches!(i.state, State::Asking(_)))
+            .filter(|(t, i)| *t == tab && matches!(i.state, State::Asking(_)))
             .count();
         let mut decided = None;
         let mut cancel = false;
@@ -1949,19 +2126,21 @@ impl App {
             });
         });
         if let Some(action) = decided {
-            self.transfers.decide(item.id, action, self.exists_all);
+            self.tab_at(tab)
+                .transfers
+                .decide(item.id, action, self.exists_all);
             if self.exists_all {
                 self.settings.exists = action;
                 self.exists_all = false;
             }
         } else if cancel {
-            self.transfers.cancel(item.id);
+            self.tab_at(tab).transfers.cancel(item.id);
         }
     }
 
     /// Over everything while the security key waits to be touched.
     fn touch_overlay(&mut self, ctx: &egui::Context) {
-        if self.state != (ConnState::Connecting { touch: true }) || self.dialog.is_some() {
+        if self.tab.state != (ConnState::Connecting { touch: true }) || self.dialog.is_some() {
             return;
         }
         let mut cancel = false;
@@ -2005,7 +2184,7 @@ impl App {
         });
         if cancel {
             self.log(LogKind::Status, "Cancelled the login".into());
-            self.session = None;
+            self.tab.session = None;
             self.disconnect();
         }
     }
@@ -2015,16 +2194,16 @@ impl App {
     fn mkdir(&mut self, side: Side, name: &str) {
         match side {
             Side::Local => {
-                let dir = PathBuf::from(&self.local.path).join(name);
+                let dir = PathBuf::from(&self.tab.local.path).join(name);
                 if let Err(e) = std::fs::create_dir(&dir) {
                     self.log(LogKind::Error, format!("Creating {}: {e}", dir.display()));
                 }
-                let current = PathBuf::from(&self.local.path);
+                let current = PathBuf::from(&self.tab.local.path);
                 self.list_local(&current);
             }
             Side::Remote => {
-                if let Some(session) = &self.session {
-                    session.send(Command::Mkdir(path::join(&self.remote.path, name)));
+                if let Some(session) = &self.tab.session {
+                    session.send(Command::Mkdir(path::join(&self.tab.remote.path, name)));
                 }
             }
         }
@@ -2036,21 +2215,21 @@ impl App {
         }
         match side {
             Side::Local => {
-                let dir = PathBuf::from(&self.local.path);
+                let dir = PathBuf::from(&self.tab.local.path);
                 if let Err(e) = std::fs::rename(dir.join(from), dir.join(to)) {
                     self.log(LogKind::Error, format!("Renaming {from}: {e}"));
                 }
                 self.list_local(&dir);
             }
             Side::Remote => {
-                if let Some(session) = &self.session {
+                if let Some(session) = &self.tab.session {
                     let target = if to.starts_with('/') {
                         to.to_owned()
                     } else {
-                        path::join(&self.remote.path, to)
+                        path::join(&self.tab.remote.path, to)
                     };
                     session.send(Command::Rename {
-                        from: path::join(&self.remote.path, from),
+                        from: path::join(&self.tab.remote.path, from),
                         to: target,
                     });
                 }
@@ -2061,7 +2240,7 @@ impl App {
     fn delete(&mut self, side: Side, names: &[String]) {
         match side {
             Side::Local => {
-                let dir = PathBuf::from(&self.local.path);
+                let dir = PathBuf::from(&self.tab.local.path);
                 for name in names {
                     if let Err(e) = local::delete(&dir.join(name)) {
                         self.log(LogKind::Error, format!("Deleting {name}: {e}"));
@@ -2073,12 +2252,12 @@ impl App {
                 let targets = names
                     .iter()
                     .map(|name| {
-                        let row = self.remote.row(name);
+                        let row = self.tab.remote.row(name);
                         let is_dir = row.is_some_and(|r| r.is_dir && !r.symlink);
-                        (path::join(&self.remote.path, name), is_dir)
+                        (path::join(&self.tab.remote.path, name), is_dir)
                     })
                     .collect();
-                if let Some(session) = &self.session {
+                if let Some(session) = &self.tab.session {
                     session.send(Command::Delete(targets));
                 }
             }
@@ -2086,11 +2265,11 @@ impl App {
     }
 
     fn chmod(&mut self, names: &[String], mode: u32) {
-        if let Some(session) = &self.session {
+        if let Some(session) = &self.tab.session {
             session.send(Command::Chmod {
                 paths: names
                     .iter()
-                    .map(|n| path::join(&self.remote.path, n))
+                    .map(|n| path::join(&self.tab.remote.path, n))
                     .collect(),
                 mode,
             });
@@ -2101,9 +2280,9 @@ impl App {
         if ctx.egui_wants_keyboard_input() || self.dialog.is_some() {
             return;
         }
-        let pane = match self.focus {
-            Side::Local => &mut self.local,
-            Side::Remote => &mut self.remote,
+        let pane = match self.tab.focus {
+            Side::Local => &mut self.tab.local,
+            Side::Remote => &mut self.tab.remote,
         };
         let selection = pane.selected();
         let mut actions = Vec::new();
@@ -2124,9 +2303,9 @@ impl App {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
             pane.select_all();
         }
-        let connected = self.state == ConnState::Connected;
+        let connected = self.tab.state == ConnState::Connected;
         for action in actions {
-            match self.focus {
+            match self.tab.focus {
                 Side::Local => self.local_action(action),
                 Side::Remote if connected => self.remote_action(action),
                 Side::Remote => {}
@@ -2167,6 +2346,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_background(&ctx);
         self.poll_session(&ctx);
         self.poll_transfers();
 
@@ -2184,11 +2364,9 @@ impl eframe::App for App {
         }
         // Repaint while transfers run, for their progress.
         if self
-            .transfers
-            .queue()
-            .items
+            .all_items()
             .iter()
-            .any(|i| i.state == State::Active)
+            .any(|(_, i)| i.state == State::Active)
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
@@ -2218,6 +2396,17 @@ impl eframe::App for App {
             .size_range(80.0..=600.0)
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::same(8)))
             .show(ui, |ui| self.queue_ui(ui));
+        egui::Panel::top("tabs")
+            .frame(
+                egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin {
+                    left: 8,
+                    right: 8,
+                    top: 4,
+                    bottom: 0,
+                }),
+            )
+            .show_separator_line(false)
+            .show(ui, |ui| self.tab_bar(ui));
         let width = ui.available_width();
         let pane_frame =
             egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::same(8));
@@ -2226,27 +2415,28 @@ impl eframe::App for App {
             .default_size(width / 2.0)
             .size_range(260.0..=(width - 260.0).max(260.0))
             .frame(pane_frame)
-            .show(ui, |ui| self.local.ui(ui, "Local site", true));
-        let connected = self.state == ConnState::Connected;
+            .show(ui, |ui| self.tab.local.ui(ui, "Local site", true));
+        let connected = self.tab.state == ConnState::Connected;
         // Framed as the local side, so both line up.
         let remote = egui::CentralPanel::default()
             .frame(pane_frame)
-            .show(ui, |ui| self.remote.ui(ui, "Remote site", connected));
+            .show(ui, |ui| self.tab.remote.ui(ui, "Remote site", connected));
         let pressed = ctx.input(|i| i.pointer.any_pressed());
         if pressed && local.response.contains_pointer() {
-            self.focus = Side::Local;
+            self.tab.focus = Side::Local;
         } else if pressed && remote.response.contains_pointer() {
-            self.focus = Side::Remote;
+            self.tab.focus = Side::Remote;
         }
         for action in local.inner {
-            self.focus = Side::Local;
+            self.tab.focus = Side::Local;
             self.local_action(action);
         }
         for action in remote.inner {
-            self.focus = Side::Remote;
+            self.tab.focus = Side::Remote;
             self.remote_action(action);
         }
 
+        self.tab_keys(&ctx);
         self.keys(&ctx);
         self.site_manager_ui(&ctx);
         self.touch_overlay(&ctx);
@@ -2254,11 +2444,25 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Some(paths) = &self.paths {
+            let saved = (0..self.tabs.len())
+                .flat_map(|t| self.tab_at(t).transfers.unfinished())
+                .map(|(server, item)| config::SavedTransfer { server, item })
+                .collect();
+            if let Err(e) = config::save_queue(paths, saved) {
+                tracing::warn!("{e}");
+            }
+        }
+        if !self.tab.local.path.is_empty() {
+            self.settings.local_dir = self.tab.local.path.clone();
+        }
         eframe::set_value(storage, "settings", &self.settings);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.disconnect();
+        for index in 0..self.tabs.len() {
+            self.with_tab(index, Self::disconnect);
+        }
     }
 }
 
@@ -2528,6 +2732,9 @@ mod tests {
         assert!(parse_host("  ").is_none());
     }
 }
+
+#[path = "tabs.rs"]
+mod tabs;
 
 #[cfg(test)]
 #[path = "screenshots.rs"]

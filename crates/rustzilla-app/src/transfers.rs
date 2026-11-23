@@ -4,10 +4,10 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rustzilla_remote::{ErrorKind, Server, Session, path};
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::local;
 use crate::session::LogKind;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Direction {
     Upload,
     Download,
@@ -147,7 +148,8 @@ pub struct Transfers {
     workers: Vec<JoinHandle<()>>,
 }
 
-/// A transfer to add to the queue.
+/// A transfer to add to the queue; what's saved of the queue between runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewItem {
     pub direction: Direction,
     pub local: PathBuf,
@@ -238,6 +240,62 @@ impl Transfers {
                 _ => {}
             }
         }
+    }
+
+    /// Queues every failed or cancelled transfer again.
+    pub fn retry_failed(&self) {
+        let ids: Vec<u64> = self
+            .queue()
+            .items
+            .iter()
+            .filter(|i| matches!(i.state, State::Failed(_) | State::Cancelled))
+            .map(|i| i.id)
+            .collect();
+        for id in ids {
+            self.retry(id);
+        }
+    }
+
+    /// Takes the transfers that wait for `server` out of the queue, for a
+    /// tab connected to it to run them.
+    pub fn take_waiting(&self, server: &str) -> Vec<NewItem> {
+        let mut queue = self.queue();
+        let mut taken = Vec::new();
+        queue.items.retain(|i| {
+            let waiting = i.state == State::Queued && i.server == server;
+            if waiting {
+                taken.push(NewItem {
+                    direction: i.direction,
+                    local: i.local.clone(),
+                    remote: i.remote.clone(),
+                    is_dir: i.is_dir,
+                    size: i.size,
+                });
+            }
+            !waiting
+        });
+        taken
+    }
+
+    /// What's still to do, to keep for the next run: with the server.
+    pub fn unfinished(&self) -> Vec<(String, NewItem)> {
+        self.queue()
+            .items
+            .iter()
+            .filter(|i| matches!(i.state, State::Queued | State::Active | State::Asking(_)))
+            .map(|i| {
+                (
+                    i.server.clone(),
+                    NewItem {
+                        direction: i.direction,
+                        local: i.local.clone(),
+                        remote: i.remote.clone(),
+                        is_dir: i.is_dir,
+                        size: i.size,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Queues a failed or cancelled transfer again.
@@ -580,7 +638,10 @@ fn run(
                 },
             };
             let mut last = Instant::now();
+            let mut counted = offset;
             let mut progress = |done: u64| {
+                throttle(direction, done.saturating_sub(counted));
+                counted = done;
                 if last.elapsed().as_millis() >= 100 {
                     last = Instant::now();
                     if let Some(item) = shared.queue.lock().expect("queue mutex").item(job.id) {
@@ -621,6 +682,53 @@ fn run(
     }
 }
 
+/// The speed limits, in bytes per second (0: none), downloads and uploads,
+/// for all transfers together.
+static LIMITS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// When the bytes counted so far may have gone, by the limit: a transfer
+/// that's ahead of it waits.
+static PACE: Mutex<[Option<Instant>; 2]> = Mutex::new([None, None]);
+
+fn slot(direction: Direction) -> usize {
+    match direction {
+        Direction::Download => 0,
+        Direction::Upload => 1,
+    }
+}
+
+/// Sets the speed limit of `direction` in bytes per second; 0 for none.
+pub fn set_limit(direction: Direction, bytes_per_second: u64) {
+    LIMITS[slot(direction)].store(bytes_per_second, Ordering::Relaxed);
+}
+
+/// Waits as long as `bytes` more take at the speed limit, less what's left
+/// of the time before: transfers share the limit.
+fn throttle(direction: Direction, bytes: u64) {
+    let limit = LIMITS[slot(direction)].load(Ordering::Relaxed);
+    if limit == 0 || bytes == 0 {
+        return;
+    }
+    let wait = {
+        let mut pace = PACE.lock().expect("pace mutex");
+        pace_for(&mut pace[slot(direction)], Instant::now(), bytes, limit)
+    };
+    if !wait.is_zero() {
+        thread::sleep(wait);
+    }
+}
+
+/// How long to wait after `bytes` at `limit` bytes per second, `at` being
+/// when what went before may have gone. A pause doesn't save up: at most a
+/// quarter second of credit.
+fn pace_for(at: &mut Option<Instant>, now: Instant, bytes: u64, limit: u64) -> Duration {
+    let credit = now.checked_sub(Duration::from_millis(250)).unwrap_or(now);
+    let from = at.unwrap_or(now).max(credit);
+    let next = from + Duration::from_secs_f64(bytes as f64 / limit as f64);
+    *at = Some(next);
+    next.saturating_duration_since(now)
+}
+
 fn set_size(shared: &Shared, id: u64, size: u64) {
     if let Some(item) = shared.queue.lock().expect("queue mutex").item(id) {
         item.size = size;
@@ -629,8 +737,6 @@ fn set_size(shared: &Shared, id: u64, size: u64) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use rustzilla_remote::testserver::TestServer;
 
     use super::*;
@@ -660,6 +766,43 @@ mod tests {
             .filter(|i| !i.is_dir)
             .map(|i| (i.remote.clone(), i.state.clone()))
             .collect()
+    }
+
+    #[test]
+    fn speed_limit_paces() {
+        let start = Instant::now() + Duration::from_secs(1);
+        let mut at = None;
+        // 1000 bytes/s: 500 bytes are half a second ahead.
+        assert_eq!(
+            pace_for(&mut at, start, 500, 1000),
+            Duration::from_millis(500)
+        );
+        // Another 500 at once: a second ahead.
+        assert_eq!(pace_for(&mut at, start, 500, 1000), Duration::from_secs(1));
+        // After a long pause only a quarter second counts as credit.
+        let later = start + Duration::from_secs(10);
+        assert_eq!(
+            pace_for(&mut at, later, 500, 1000),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn waiting_transfers_move_and_are_kept() {
+        let transfers = Transfers::new(Exists::Ask);
+        let item = |name: &str| NewItem {
+            direction: Direction::Upload,
+            local: PathBuf::from(name),
+            remote: format!("/{name}"),
+            is_dir: false,
+            size: 1,
+        };
+        transfers.add("a", vec![item("1"), item("2")]);
+        transfers.add("b", vec![item("3")]);
+        assert_eq!(transfers.unfinished().len(), 3);
+        let taken = transfers.take_waiting("a");
+        assert_eq!(taken, vec![item("1"), item("2")]);
+        assert_eq!(transfers.unfinished(), vec![("b".to_owned(), item("3"))]);
     }
 
     #[test]

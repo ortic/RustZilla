@@ -97,7 +97,7 @@ fn connect(harness: &mut Harness<'_, App>, server: &TestServer) {
         },
     );
     wait(harness, "the remote listing", |app| {
-        app.state == ConnState::Connected && !app.remote.rows.is_empty()
+        app.tab.state == ConnState::Connected && !app.tab.remote.rows.is_empty()
     });
 }
 
@@ -114,7 +114,13 @@ fn connected_with_transfers() {
     connect(&mut harness, &server);
     {
         let app = harness.state();
-        let names: Vec<&str> = app.remote.rows.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = app
+            .tab
+            .remote
+            .rows
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
         assert_eq!(
             names,
             [
@@ -129,7 +135,7 @@ fn connected_with_transfers() {
         // The test server has Unix modes only on Unix.
         #[cfg(unix)]
         {
-            let deploy = app.remote.row("deploy.sh").unwrap();
+            let deploy = app.tab.remote.row("deploy.sh").unwrap();
             assert_eq!(format::permissions(deploy), "-rwxr-xr-x");
         }
     }
@@ -139,14 +145,15 @@ fn connected_with_transfers() {
         .state_mut()
         .remote_action(Action::Open("upload".into()));
     wait(&mut harness, "the upload directory", |app| {
-        app.remote.path == "/upload" && !app.remote.busy
+        app.tab.remote.path == "/upload" && !app.tab.remote.busy
     });
     harness.state_mut().local_action(Action::Transfer(vec![
         "report-2026.pdf".into(),
         "site".into(),
     ]));
     wait(&mut harness, "the uploads", |app| {
-        app.transfers
+        app.tab
+            .transfers
             .queue()
             .items
             .iter()
@@ -160,10 +167,10 @@ fn connected_with_transfers() {
     );
     // The remote pane shows what arrived.
     wait(&mut harness, "the refreshed listing", |app| {
-        app.remote.row("report-2026.pdf").is_some() && app.remote.row("site").is_some()
+        app.tab.remote.row("report-2026.pdf").is_some() && app.tab.remote.row("site").is_some()
     });
     // Queued for a server that isn't connected: they wait.
-    harness.state().transfers.add(
+    harness.state().tab.transfers.add(
         "backup.example.com",
         vec![NewItem {
             direction: Direction::Upload,
@@ -182,19 +189,19 @@ fn connected_with_transfers() {
     // Mkdir, rename and delete on the server, through the dialogs' actions.
     harness.state_mut().mkdir(Side::Remote, "new-dir");
     wait(&mut harness, "the new directory", |app| {
-        app.remote.row("new-dir").is_some()
+        app.tab.remote.row("new-dir").is_some()
     });
     harness
         .state_mut()
         .rename(Side::Remote, "new-dir", "renamed");
     wait(&mut harness, "the rename", |app| {
-        app.remote.row("renamed").is_some()
+        app.tab.remote.row("renamed").is_some()
     });
     harness
         .state_mut()
         .delete(Side::Remote, &["renamed".into(), "site".into()]);
     wait(&mut harness, "the deletes", |app| {
-        app.remote.row("renamed").is_none() && app.remote.row("site").is_none()
+        app.tab.remote.row("renamed").is_none() && app.tab.remote.row("site").is_none()
     });
     assert!(!served.join("upload/site").exists());
     #[cfg(unix)]
@@ -203,7 +210,8 @@ fn connected_with_transfers() {
             .state_mut()
             .chmod(&["report-2026.pdf".into()], 0o600);
         wait(&mut harness, "the permissions", |app| {
-            app.remote
+            app.tab
+                .remote
                 .row("report-2026.pdf")
                 .is_some_and(|r| r.permissions == Some(0o600))
         });
@@ -211,7 +219,7 @@ fn connected_with_transfers() {
 
     harness.state_mut().disconnect();
     harness.step();
-    assert!(harness.state().remote.rows.is_empty());
+    assert!(harness.state().tab.remote.rows.is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -230,7 +238,8 @@ fn target_exists_asks() {
         .state_mut()
         .remote_action(Action::Transfer(vec!["database.sql.gz".into()]));
     wait(&mut harness, "the question", |app| {
-        app.transfers
+        app.tab
+            .transfers
             .queue()
             .items
             .iter()
@@ -240,7 +249,8 @@ fn target_exists_asks() {
     save(&mut harness, "exists");
     harness.get_by_label("OK").click();
     wait(&mut harness, "the resumed download", |app| {
-        app.transfers
+        app.tab
+            .transfers
             .queue()
             .items
             .iter()
@@ -277,7 +287,7 @@ fn unknown_host_key_then_trusted() {
     save(&mut harness, "host-key");
     harness.get_by_label("Trust and connect").click();
     wait(&mut harness, "the listing", |app| {
-        app.remote.row("www").is_some()
+        app.tab.remote.row("www").is_some()
     });
     assert!(
         fs::read_to_string(dir.join("known_hosts"))
@@ -325,11 +335,11 @@ fn security_key_prompts() {
     assert!(harness.state().site_manager.is_none());
 
     // Waiting for the touch.
-    harness.state_mut().state = ConnState::Connecting { touch: true };
+    harness.state_mut().tab.state = ConnState::Connecting { touch: true };
     save(&mut harness, "touch");
     harness.get_by_label("Cancel").click();
     harness.step();
-    assert!(harness.state().state == ConnState::Idle);
+    assert!(harness.state().tab.state == ConnState::Idle);
 
     // The key wants its PIN: asked, then used for the next attempt.
     let attempt = Attempt {
@@ -419,10 +429,10 @@ fn ftps_certificate_then_listing() {
     save(&mut harness, "certificate");
     harness.get_by_label("Trust and connect").click();
     wait(&mut harness, "the listing", |app| {
-        app.state == ConnState::Connected && app.remote.row("public_html").is_some()
+        app.tab.state == ConnState::Connected && app.tab.remote.row("public_html").is_some()
     });
     assert_eq!(
-        harness.state().connection.as_ref().unwrap().security(),
+        harness.state().tab.connection.as_ref().unwrap().security(),
         Security::Tls
     );
     // Upload over FTPS and see it arrive.
@@ -430,7 +440,7 @@ fn ftps_certificate_then_listing() {
         .state_mut()
         .local_action(Action::Transfer(vec!["notes.md".into()]));
     wait(&mut harness, "the upload", |app| {
-        app.remote.row("notes.md").is_some()
+        app.tab.remote.row("notes.md").is_some()
     });
     assert_eq!(
         fs::read_to_string(served.join("notes.md")).unwrap(),
@@ -470,20 +480,20 @@ fn s3_buckets_and_upload() {
     );
     // The root lists the buckets.
     wait(&mut harness, "the buckets", |app| {
-        app.state == ConnState::Connected && app.remote.row("backups").is_some()
+        app.tab.state == ConnState::Connected && app.tab.remote.row("backups").is_some()
     });
     harness
         .state_mut()
         .remote_action(Action::Open("backups".into()));
     wait(&mut harness, "the bucket", |app| {
-        app.remote.path == "/backups" && !app.remote.busy
+        app.tab.remote.path == "/backups" && !app.tab.remote.busy
     });
     harness.state_mut().local_action(Action::Transfer(vec![
         "report-2026.pdf".into(),
         "site".into(),
     ]));
     wait(&mut harness, "the uploads", |app| {
-        app.remote.row("report-2026.pdf").is_some() && app.remote.row("site").is_some()
+        app.tab.remote.row("report-2026.pdf").is_some() && app.tab.remote.row("site").is_some()
     });
     assert_eq!(
         fs::read(served.join("backups/site/index.html")).unwrap(),
