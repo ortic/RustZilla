@@ -1,4 +1,4 @@
-//! RustZilla – a fast, native SFTP client.
+//! RustZilla – a fast, native SFTP, FTP(S), WebDAV and S3 client.
 
 // Release builds are GUI programs on Windows, without a console window;
 // debug builds keep it for development.
@@ -167,4 +167,81 @@ fn init_logging(paths: Option<&Paths>) {
         )
         .with(file_layer)
         .init();
+}
+
+/// Writes the icons of the packages from `assets/icon/rustzilla.svg`:
+/// `RUSTZILLA_WRITE_ICONS=1 cargo test -p rustzilla-app write_icons`.
+#[cfg(test)]
+mod icon_files {
+    use resvg::{tiny_skia, usvg};
+
+    fn png(size: u32) -> Vec<u8> {
+        let tree = usvg::Tree::from_str(super::APP_ICON, &usvg::Options::default()).unwrap();
+        let mut pixmap = tiny_skia::Pixmap::new(size, size).unwrap();
+        let scale = size as f32 / tree.size().width();
+        resvg::render(
+            &tree,
+            tiny_skia::Transform::from_scale(scale, scale),
+            &mut pixmap.as_mut(),
+        );
+        pixmap.encode_png().unwrap()
+    }
+
+    /// An .ico of PNG images (Windows Vista and later read them).
+    fn ico(sizes: &[u32]) -> Vec<u8> {
+        let images: Vec<Vec<u8>> = sizes.iter().map(|&s| png(s)).collect();
+        let mut out = vec![0, 0, 1, 0];
+        out.extend((sizes.len() as u16).to_le_bytes());
+        let mut offset = 6 + 16 * sizes.len() as u32;
+        for (size, image) in sizes.iter().zip(&images) {
+            let dim = if *size >= 256 { 0 } else { *size as u8 };
+            out.extend([dim, dim, 0, 0]);
+            out.extend(1u16.to_le_bytes());
+            out.extend(32u16.to_le_bytes());
+            out.extend((image.len() as u32).to_le_bytes());
+            out.extend(offset.to_le_bytes());
+            offset += image.len() as u32;
+        }
+        for image in images {
+            out.extend(image);
+        }
+        out
+    }
+
+    /// An .icns of PNG images.
+    fn icns() -> Vec<u8> {
+        let mut body = Vec::new();
+        for (kind, size) in [
+            (b"icp4", 16),
+            (b"icp5", 32),
+            (b"ic07", 128),
+            (b"ic08", 256),
+            (b"ic09", 512),
+            (b"ic10", 1024),
+        ] {
+            let image = png(size);
+            body.extend(kind);
+            body.extend(((image.len() + 8) as u32).to_be_bytes());
+            body.extend(image);
+        }
+        let mut out = b"icns".to_vec();
+        out.extend(((body.len() + 8) as u32).to_be_bytes());
+        out.extend(body);
+        out
+    }
+
+    #[test]
+    fn write_icons() {
+        // Always: the icon renders.
+        assert!(png(32).starts_with(b"\x89PNG"));
+        if std::env::var_os("RUSTZILLA_WRITE_ICONS").is_none() {
+            return;
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/icon");
+        for size in [16, 24, 32, 48, 64, 128, 256, 512, 1024] {
+            std::fs::write(dir.join(format!("rustzilla-{size}.png")), png(size)).unwrap();
+        }
+        std::fs::write(dir.join("rustzilla.ico"), ico(&[16, 24, 32, 48, 64, 256])).unwrap();
+        std::fs::write(dir.join("rustzilla.icns"), icns()).unwrap();
+    }
 }

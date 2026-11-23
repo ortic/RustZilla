@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "A fast, native SFTP client"
+description = "Fast, native SFTP, FTP(S), WebDAV and S3 client"
 authors = ["Remo Laubacher"]
+homepage = "https://github.com/ortic/RustZilla"
+repository = "https://github.com/ortic/RustZilla"
 
 [[bin]]
 name = "rustzilla"
@@ -32,6 +34,57 @@ tracing-subscriber.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["x11"] }
 
+[build-dependencies]
+# The icon and version resource of rustzilla.exe (build.rs).
+embed-resource = "3"
+
 [dev-dependencies]
 rustzilla-remote = { workspace = true, features = ["test-server"] }
 egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
+
+# Installers and packages: `cargo packager --release -p rustzilla-app`.
+[package.metadata.packager]
+productName = "RustZilla"
+identifier = "com.ortic.rustzilla"
+publisher = "Remo Laubacher"
+copyright = "Copyright © 2026 Remo Laubacher"
+category = "Utility"
+description = "Fast, native SFTP, FTP(S), WebDAV and S3 client"
+longDescription = """
+RustZilla moves files between your computer and servers over SFTP, FTP,
+FTPS, WebDAV and S3, with the layout FileZilla users know. It logs in with
+passwords, key files, the SSH agent and FIDO security keys such as
+YubiKeys."""
+homepage = "https://github.com/ortic/RustZilla"
+licenseFile = "../../LICENSE-MIT"
+# `cargo build --release -p rustzilla-app`, an alias in .cargo/config.toml.
+beforePackagingCommand = "cargo package-build"
+outDir = "../../target/packages"
+binariesDir = "../../target/release"
+icons = ["../../assets/icon/rustzilla-32.png", "../../assets/icon/rustzilla-128.png", "../../assets/icon/rustzilla-256.png", "../../assets/icon/rustzilla-512.png", "../../assets/icon/rustzilla.ico", "../../assets/icon/rustzilla.icns"]
+resources = ["../../README.md", "../../CHANGELOG.md", "../../LICENSE-MIT", "../../LICENSE-APACHE"]
+
+[[package.metadata.packager.binaries]]
+path = "rustzilla"
+main = true
+
+[package.metadata.packager.deb]
+desktopTemplate = "../../assets/linux/com.ortic.rustzilla.desktop"
+section = "net"
+
+[package.metadata.packager.deb.files]
+"../../assets/linux/com.ortic.rustzilla.metainfo.xml" = "usr/share/metainfo/com.ortic.rustzilla.metainfo.xml"
+"../../assets/icon/rustzilla.svg" = "usr/share/icons/hicolor/scalable/apps/rustzilla.svg"
+
+[package.metadata.packager.appimage.files]
+"../../assets/linux/com.ortic.rustzilla.metainfo.xml" = "usr/share/metainfo/com.ortic.rustzilla.metainfo.xml"
+
+[package.metadata.packager.macos]
+minimumSystemVersion = "11.0"
+
+[package.metadata.packager.nsis]
+installerIcon = "../../assets/icon/rustzilla.ico"
+installMode = "perMachine"
+
+[package.metadata.packager.wix]
+languages = ["en-US"]

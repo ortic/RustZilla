@@ -1,0 +1,31 @@
+// Windows resources of rustzilla.exe: its icon, and the version strings of
+// its properties. build.rs passes the RUSTZILLA_VERSION macros.
+#pragma code_page(65001)
+
+1 ICON "../../assets/icon/rustzilla.ico"
+
+1 VERSIONINFO
+FILEVERSION RUSTZILLA_VERSION_MAJOR, RUSTZILLA_VERSION_MINOR, RUSTZILLA_VERSION_PATCH, 0
+PRODUCTVERSION RUSTZILLA_VERSION_MAJOR, RUSTZILLA_VERSION_MINOR, RUSTZILLA_VERSION_PATCH, 0
+FILEOS 0x40004 // VOS_NT_WINDOWS32
+FILETYPE 0x1 // VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0" // U.S. English, Unicode
+        BEGIN
+            VALUE "CompanyName", "Remo Laubacher"
+            VALUE "FileDescription", "RustZilla"
+            VALUE "FileVersion", RUSTZILLA_VERSION
+            VALUE "InternalName", "rustzilla"
+            VALUE "LegalCopyright", "Copyright © 2026 Remo Laubacher"
+            VALUE "OriginalFilename", "rustzilla.exe"
+            VALUE "ProductName", "RustZilla"
+            VALUE "ProductVersion", RUSTZILLA_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

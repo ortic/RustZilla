@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.ortic.rustzilla</id>
+  <name>RustZilla</name>
+  <summary>Fast, native SFTP, FTP(S), WebDAV and S3 client</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <developer id="com.ortic">
+    <name>Remo Laubacher</name>
+  </developer>
+  <description>
+    <p>
+      RustZilla moves files between your computer and servers, with the
+      layout FileZilla users know: the local and the remote side next to
+      each other, a transfer queue, a message log and a Site Manager.
+    </p>
+    <ul>
+      <li>SFTP, FTP, FTPS (explicit and implicit), WebDAV and Amazon S3 and compatible stores</li>
+      <li>Logins with passwords, key files, the SSH agent and FIDO security keys such as YubiKeys</li>
+      <li>Parallel transfers of files and folders, with resume and a choice for existing files</li>
+      <li>Host keys and TLS certificates to trust, passwords kept in the system's keychain</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">rustzilla.desktop</launchable>
+  <url type="homepage">https://github.com/ortic/RustZilla</url>
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+  </categories>
+  <provides>
+    <binary>rustzilla</binary>
+  </provides>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Local and remote side with the transfer queue</caption>
+      <image>https://raw.githubusercontent.com/ortic/RustZilla/master/docs/main.png</image>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-23"/>
+  </releases>
+</component>

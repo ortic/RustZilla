@@ -1,5 +1,7 @@
 # RustZilla
 
+[![CI](https://github.com/ortic/RustZilla/actions/workflows/ci.yml/badge.svg)](https://github.com/ortic/RustZilla/actions/workflows/ci.yml)
+
 A fast, native file transfer client in the spirit of FileZilla, written in
 Rust on the same stack as [DbCraft](https://github.com/ortic/dbcraft):
 eframe/egui 0.36 for the UI, russh (pure Rust, on ring) for SSH, rustls for
@@ -59,6 +61,12 @@ Protocols: **SFTP**, **FTP**, **FTPS** (explicit and implicit TLS),
   stops the connect.
 
 ![Touching a security key to log in](docs/security-key.png)
+
+## Download
+
+Packages for Linux (`.deb`, AppImage), Windows (`.msi`, setup `.exe`) and
+macOS (`.dmg`, Apple Silicon and Intel) are on the
+[releases page](https://github.com/ortic/RustZilla/releases).
 
 ## Building
 

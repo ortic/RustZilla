@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=RustZilla
+GenericName=File Transfer Client
+Comment=Fast, native SFTP, FTP(S), WebDAV and S3 client
+Exec={{exec}} %F
+Icon={{icon}}
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=sftp;ftp;ftps;webdav;s3;ssh;transfer;upload;download;yubikey;
+StartupWMClass=rustzilla
