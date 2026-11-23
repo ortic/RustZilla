@@ -32,7 +32,8 @@ pub struct Caps {
 
 #[allow(dead_code)]
 pub const ALL: Caps = Caps {
-    chmod: true,
+    // The test server keeps Unix modes only on Unix.
+    chmod: cfg!(unix),
     empty_dirs: true,
 };
 #[allow(dead_code)]

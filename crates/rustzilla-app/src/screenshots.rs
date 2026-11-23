@@ -126,8 +126,12 @@ fn connected_with_transfers() {
                 "deploy.sh"
             ]
         );
-        let deploy = app.remote.row("deploy.sh").unwrap();
-        assert_eq!(format::permissions(deploy), "-rwxr-xr-x");
+        // The test server has Unix modes only on Unix.
+        #[cfg(unix)]
+        {
+            let deploy = app.remote.row("deploy.sh").unwrap();
+            assert_eq!(format::permissions(deploy), "-rwxr-xr-x");
+        }
     }
 
     // Upload a file and a directory, download one: as the panes do it.
@@ -193,14 +197,17 @@ fn connected_with_transfers() {
         app.remote.row("renamed").is_none() && app.remote.row("site").is_none()
     });
     assert!(!served.join("upload/site").exists());
-    harness
-        .state_mut()
-        .chmod(&["report-2026.pdf".into()], 0o600);
-    wait(&mut harness, "the permissions", |app| {
-        app.remote
-            .row("report-2026.pdf")
-            .is_some_and(|r| r.permissions == Some(0o600))
-    });
+    #[cfg(unix)]
+    {
+        harness
+            .state_mut()
+            .chmod(&["report-2026.pdf".into()], 0o600);
+        wait(&mut harness, "the permissions", |app| {
+            app.remote
+                .row("report-2026.pdf")
+                .is_some_and(|r| r.permissions == Some(0o600))
+        });
+    }
 
     harness.state_mut().disconnect();
     harness.step();

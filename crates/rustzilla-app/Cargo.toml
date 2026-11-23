@@ -6,7 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 description = "Fast, native SFTP, FTP(S), WebDAV and S3 client"
 authors = ["Remo Laubacher"]
-homepage = "https://github.com/ortic/RustZilla"
 repository = "https://github.com/ortic/RustZilla"
 
 [[bin]]
